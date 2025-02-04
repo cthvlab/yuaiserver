@@ -19,8 +19,8 @@
 ### 1. Клонирование репозитория
 
 ```sh
-git clone https://github.com/yourrepo/yuai-server.git
-cd yuai-server
+git clone https://github.com/cthvlab/yuaiserver.git
+cd yuaiserver
 ```
 
 ### 2. Установка зависимостей
