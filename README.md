@@ -77,4 +77,6 @@ Welcome to YUAI SERVER
 curl --http3 https://localhost:4433
 ```
 
+## Авторы
 
+Разработано сообществом ЮАИ [yuai.ru](https://yuai.ru) 
