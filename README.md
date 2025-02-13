@@ -25,7 +25,7 @@ _____.___.____ ___  _____  .___
 ## Установка и запуск
 ### 1. Клонирование репозитория
 ```sh
-git clone https://github.com/yourrepo/yuai-server.git
+git clone https://github.com/cthvlab/yuai-server.git
 cd yuai-server
 ```
 
