@@ -1,5 +1,5 @@
 use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Request, Response, Server};
+use hyper::{Body, Request, Response, Server, header};
 use hyper::server::conn::{AddrStream, AddrIncoming};
 use hyper_rustls::{TlsAcceptor, acceptor::TlsStream};
 use rustls::{Certificate, PrivateKey, ServerConfig};
@@ -29,6 +29,9 @@ use tokio::net::TcpListener;
 use webrtc::api::APIBuilder;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+
+// Константа для заголовка Content-Type
+const CONTENT_TYPE_UTF8: &str = "text/plain; charset=utf-8";
 
 // Структура конфигурации
 #[derive(Deserialize, Clone, PartialEq)]
@@ -143,13 +146,13 @@ fn check_jwt(req: &Request<Body>, secret: &str) -> bool {
 }
 
 // Извлечение реального IP из запроса
-fn get_client_ip(req: &Request<Body>, client_ip: IpAddr) -> String {
+fn get_client_ip(req: &Request<Body>, client_ip: Option<IpAddr>) -> Option<String> {
     req.headers()
         .get("X-Forwarded-For")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.split(',').next())
         .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| client_ip.to_string())
+        .or_else(|| client_ip.map(|ip| ip.to_string()))
 }
 
 // Обработка WebSocket
@@ -201,20 +204,17 @@ async fn handle_webrtc_offer(
         .map_err(|e| e.to_string())?;
     let peer_connection = Arc::new(peer_connection);
 
-    // Создаём канал данных
     let data_channel = peer_connection
         .create_data_channel("proxy", None)
         .await
         .map_err(|e| e.to_string())?;
 
-    // Устанавливаем удалённое описание (offer от клиента)
     let offer = RTCSessionDescription::offer(offer_sdp).map_err(|e| e.to_string())?;
     peer_connection
         .set_remote_description(offer)
         .await
         .map_err(|e| e.to_string())?;
 
-    // Создаём ответ (answer)
     let answer = peer_connection
         .create_answer(None)
         .await
@@ -224,14 +224,12 @@ async fn handle_webrtc_offer(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Сохраняем соединение
     state
         .webrtc_peers
         .lock()
         .await
         .insert(client_ip.clone(), peer_connection.clone());
 
-    // Обработка входящих данных
     data_channel.on_message(Box::new(move |msg| {
         let data = msg.data.to_vec();
         info!("Получены данные через WebRTC от {}: {:?}", client_ip, data);
@@ -245,16 +243,28 @@ async fn handle_webrtc_offer(
 async fn handle_http_request(
     req: Request<Body>,
     state: Arc<ProxyState>,
-    client_ip: IpAddr,
+    client_ip: Option<IpAddr>,
 ) -> Result<Response<Body>, Infallible> {
-    let ip = get_client_ip(&req, client_ip);
+    let ip = match get_client_ip(&req, client_ip) {
+        Some(ip) => ip,
+        None => {
+            return Ok(Response::builder()
+                .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+                .body(Body::from("IP не определён, сервис не может быть предоставлен"))
+                .unwrap());
+        }
+    };
+
     let url = req.uri().to_string();
 
     // Проверка чёрного списка
     {
         let blacklist = state.blacklist.lock().await;
         if blacklist.contains(&ip) {
-            return Ok(Response::new(Body::from("Доступ запрещён")));
+            return Ok(Response::builder()
+                .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+                .body(Body::from("Доступ запрещён"))
+                .unwrap());
         }
     }
     let is_whitelisted = state.whitelist.lock().await.contains(&ip);
@@ -271,21 +281,30 @@ async fn handle_http_request(
                 state.blacklist.lock().await.insert(ip.clone());
                 attempts.remove(&ip);
                 warn!("IP {} добавлен в чёрный список", ip);
-                return Ok(Response::new(Body::from("Доступ запрещён")));
+                return Ok(Response::builder()
+                    .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+                    .body(Body::from("Доступ запрещён"))
+                    .unwrap());
             }
         } else {
             *entry = (1, now);
         }
-        return Ok(Response::new(Body::from("Неавторизован")));
+        return Ok(Response::builder()
+            .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+            .body(Body::from("Неавторизован"))
+            .unwrap());
     }
 
-    // Управление сессиями
+    // Управление сессиями (только если IP определён)
     manage_session(&state, &ip).await;
 
     // Ограничение скорости
     let max_requests = if is_whitelisted { 100 } else { 10 };
     if !check_rate_limit(&state, &ip, max_requests, Duration::from_secs(60)).await {
-        return Ok(Response::new(Body::from("Превышен лимит запросов")));
+        return Ok(Response::builder()
+            .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+            .body(Body::from("Превышен лимит запросов"))
+            .unwrap());
     }
 
     // Обработка WebSocket
@@ -299,6 +318,7 @@ async fn handle_http_request(
                 error!("Ошибка обновления соединения: {}", e);
                 return Ok(Response::builder()
                     .status(500)
+                    .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
                     .body(Body::from("Внутренняя ошибка сервера"))
                     .unwrap());
             }
@@ -317,6 +337,7 @@ async fn handle_http_request(
                 error!("Ошибка обработки WebRTC offer: {}", e);
                 return Ok(Response::builder()
                     .status(500)
+                    .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
                     .body(Body::from("Ошибка WebRTC"))
                     .unwrap());
             }
@@ -328,13 +349,19 @@ async fn handle_http_request(
     if let Some(entry) = cache.get(&url) {
         if entry.expiry > Instant::now() {
             info!("Кэшированный ответ для {}", url);
-            return Ok(Response::new(Body::from(entry.response_body.clone())));
+            return Ok(Response::builder()
+                .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+                .body(Body::from(entry.response_body.clone()))
+                .unwrap());
         }
     }
 
     // Обработка запроса
     let response_body = "Добро пожаловать".as_bytes().to_vec();
-    let response = Response::new(Body::from(response_body.clone()));
+    let response = Response::builder()
+        .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+        .body(Body::from(response_body.clone()))
+        .unwrap();
     cache.insert(url.clone(), CacheEntry {
         response_body,
         expiry: Instant::now() + Duration::from_secs(60),
@@ -347,22 +374,34 @@ async fn handle_http_request(
 async fn handle_https_request(
     req: Request<Body>,
     state: Arc<ProxyState>,
-    client_ip: IpAddr,
+    client_ip: Option<IpAddr>,
 ) -> Result<Response<Body>, Infallible> {
-    let ip = get_client_ip(&req, client_ip);
+    let ip = match get_client_ip(&req, client_ip) {
+        Some(ip) => ip,
+        None => {
+            return Ok(Response::builder()
+                .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+                .body(Body::from("IP не определён, сервис не может быть предоставлен"))
+                .unwrap());
+        }
+    };
+
     let url = req.uri().to_string();
 
     // Проверка чёрного списка
     {
         let blacklist = state.blacklist.lock().await;
         if blacklist.contains(&ip) {
-            return Ok(Response::new(Body::from("Доступ запрещён")));
+            return Ok(Response::builder()
+                .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+                .body(Body::from("Доступ запрещён"))
+                .unwrap());
         }
     }
     let is_whitelisted = state.whitelist.lock().await.contains(&ip);
 
     // Проверка авторизации
-   /*  let config = state.config.lock().await;
+    let config = state.config.lock().await;
     if !check_basic_auth(&req) && !check_jwt(&req, &config.jwt_secret) {
         let mut attempts = state.auth_attempts.lock().await;
         let now = Instant::now();
@@ -373,21 +412,30 @@ async fn handle_https_request(
                 state.blacklist.lock().await.insert(ip.clone());
                 attempts.remove(&ip);
                 warn!("IP {} добавлен в чёрный список", ip);
-                return Ok(Response::new(Body::from("Доступ запрещён")));
+                return Ok(Response::builder()
+                    .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+                    .body(Body::from("Доступ запрещён"))
+                    .unwrap());
             }
         } else {
             *entry = (1, now);
         }
-        return Ok(Response::new(Body::from("Неавторизован")));
-    } */
+        return Ok(Response::builder()
+            .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+            .body(Body::from("Неавторизован"))
+            .unwrap());
+    }
 
-    // Управление сессиями
+    // Управление сессиями (только если IP определён)
     manage_session(&state, &ip).await;
 
     // Ограничение скорости
     let max_requests = if is_whitelisted { 100 } else { 10 };
     if !check_rate_limit(&state, &ip, max_requests, Duration::from_secs(60)).await {
-        return Ok(Response::new(Body::from("Превышен лимит запросов")));
+        return Ok(Response::builder()
+            .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+            .body(Body::from("Превышен лимит запросов"))
+            .unwrap());
     }
 
     // Обработка WebSocket
@@ -401,6 +449,7 @@ async fn handle_https_request(
                 error!("Ошибка обновления соединения: {}", e);
                 return Ok(Response::builder()
                     .status(500)
+                    .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
                     .body(Body::from("Внутренняя ошибка сервера"))
                     .unwrap());
             }
@@ -419,6 +468,7 @@ async fn handle_https_request(
                 error!("Ошибка обработки WebRTC offer: {}", e);
                 return Ok(Response::builder()
                     .status(500)
+                    .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
                     .body(Body::from("Ошибка WebRTC"))
                     .unwrap());
             }
@@ -430,13 +480,19 @@ async fn handle_https_request(
     if let Some(entry) = cache.get(&url) {
         if entry.expiry > Instant::now() {
             info!("Кэшированный ответ для {}", url);
-            return Ok(Response::new(Body::from(entry.response_body.clone())));
+            return Ok(Response::builder()
+                .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+                .body(Body::from(entry.response_body.clone()))
+                .unwrap());
         }
     }
 
     // Обработка запроса
     let response_body = "Добро пожаловать (HTTPS)".as_bytes().to_vec();
-    let response = Response::new(Body::from(response_body.clone()));
+    let response = Response::builder()
+        .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+        .body(Body::from(response_body.clone()))
+        .unwrap();
     cache.insert(url.clone(), CacheEntry {
         response_body,
         expiry: Instant::now() + Duration::from_secs(60),
@@ -482,7 +538,7 @@ async fn main() {
     let state_http = state.clone();
     let http_service = make_service_fn(move |conn: &AddrStream| {
         let state = state_http.clone();
-        let client_ip = conn.remote_addr().ip();
+        let client_ip = Some(conn.remote_addr().ip()); // Безопасно извлекаем IP
         async move {
             let service = service_fn(move |req| handle_http_request(req, state.clone(), client_ip));
             Ok::<_, Infallible>(service)
@@ -493,7 +549,7 @@ async fn main() {
     let state_https = state.clone();
     let https_service = make_service_fn(move |conn: &TlsStream<AddrStream>| {
         let state = state_https.clone();
-        let client_ip = conn.io().expect("TLS stream should have an AddrStream").remote_addr().ip();
+        let client_ip = conn.io().map(|stream| stream.remote_addr().ip()); // Опциональный IP
         async move {
             let service = service_fn(move |req| handle_https_request(req, state.clone(), client_ip));
             Ok::<_, Infallible>(service)
@@ -526,10 +582,10 @@ async fn main() {
     );
 
     let (res1, res2) = join!(http_server, https_server);
-if let Err(e) = res1 {
-    error!("Ошибка HTTP сервера: {:?}", e);
-}
-if let Err(e) = res2 {
-    error!("Ошибка HTTPS сервера: {:?}", e);
-}
+    if let Err(e) = res1 {
+        error!("Ошибка HTTP сервера: {:?}", e);
+    }
+    if let Err(e) = res2 {
+        error!("Ошибка HTTPS сервера: {:?}", e);
+    }
 }
