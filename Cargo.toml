@@ -4,20 +4,22 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-webrtc = "0.6"
-hyper = { version = "0.14", features = ["server", "tcp", "http1", "http2"] }
-hyper-rustls = { version = "0.24", features = ["http1", "http2"] }
-rustls = "0.21"
-tokio = { version = "1", features = ["full"] }
+hyper = { version = "0.14", features = ["server", "tcp", "http1", "http2", "stream"] }
+hyper-rustls = "0.27"
+rustls = "0.23"
+tokio = { version = "1.0", features = ["full"] }
+tokio-rustls = "0.26"
+tokio-stream = "0.1"
 tokio-tungstenite = "0.20"
 tungstenite = "0.20"
-quinn = "0.10"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-jsonwebtoken = "8"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
 toml = "0.7"
+jsonwebtoken = "8.3"
 base64 = "0.21"
+dashmap = "5.5"
+quinn = "0.11.0"
 futures = "0.3"
-rustls-pemfile = "1"
-rustls-pki-types = "1"
+rustls-pemfile = "1.0"
+webrtc = "0.12.0"
