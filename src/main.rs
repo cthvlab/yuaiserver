@@ -9,7 +9,7 @@ use std::sync::Arc; // Инструмент для безопасного исп
 use std::time::{Duration, Instant}; // Для работы со временем
 use std::fs::File; // Для работы с файлами
 use std::io::BufReader; // Помогает читать файлы
-use tokio::sync::Mutex as TokioMutex; // Замок для безопасной работы с данными в асинхронном коде
+use tokio::sync::{Mutex as TokioMutex, RwLock}; // Замки для безопасной работы с данными в асинхронном коде
 use tokio::net::TcpListener; // Слушатель для TCP соединений
 use tokio::time::sleep; // Асинхронный "сон" (ждать какое-то время)
 use tokio_tungstenite::WebSocketStream; // Для работы с WebSocket
@@ -33,6 +33,13 @@ use hyper::upgrade::Upgraded; // Обновление соединения дл�
 // Константа для типа ответа (текст в формате UTF-8)
 const CONTENT_TYPE_UTF8: &str = "text/plain; charset=utf-8";
 
+// Структура для одной локации
+#[derive(Deserialize, Clone, PartialEq, Debug)]
+struct Location {
+    path: String,      // Путь, например, "/"
+    response: String,  // Ответ для этого пути
+}
+
 // Структура для хранения настроек сервера из config.toml
 #[derive(Deserialize, Clone, PartialEq)]
 struct Config {
@@ -45,6 +52,7 @@ struct Config {
     basic_auth_login: String,   // Логин для авторизации
     basic_auth_password: String,// Пароль для авторизации
     worker_threads: usize,      // Количество потоков для обработки задач
+    locations: Vec<Location>,   // Список локаций
 }
 
 // Структура для хранения записи в кэше (ответа сервера)
@@ -72,6 +80,7 @@ struct ProxyState {
     rate_limits: DashMap<String, (Instant, u32)>,      // Лимиты запросов
     config: TokioMutex<Config>,                        // Настройки сервера (с замком для безопасности)
     webrtc_peers: DashMap<String, Arc<RTCPeerConnection>>, // WebRTC соединения
+    locations: Arc<RwLock<Vec<Location>>>,             // Динамически обновляемый список локаций
 }
 
 // Функция для загрузки настроек из файла config.toml
@@ -238,6 +247,7 @@ async fn handle_http_request(req: Request<Body>, https_port: u16) -> Result<Resp
 }
 
 // Обрабатываем HTTPS запросы
+// Обрабатываем HTTPS запросы
 async fn handle_https_request(req: Request<Body>, state: Arc<ProxyState>, client_ip: Option<IpAddr>) -> Result<Response<Body>, Infallible> {
     let ip = match get_client_ip(&req, client_ip) { // Получаем IP клиента
         Some(ip) => ip,
@@ -285,25 +295,33 @@ async fn handle_https_request(req: Request<Body>, state: Arc<ProxyState>, client
         }
     }
 
-    // Отправляем ответ и кэшируем его
-    let response_body = "Добро пожаловать (HTTPS)".as_bytes().to_vec();
+    // Обрабатываем локации
+    let locations = state.locations.read().await; // Читаем текущие локации
+    let path = req.uri().path();
+    let response_body = locations.iter()
+        .find(|loc| path.starts_with(&loc.path)) // Находим первую подходящую локацию
+        .map(|loc| loc.response.as_bytes().to_vec()) // Берём её ответ
+        .unwrap_or_else(|| "404 Not Found".as_bytes().to_vec()); // Если нет совпадений — 404
+
+    // Кэшируем ответ
     state.cache.insert(url, CacheEntry { response_body: response_body.clone(), expiry: Instant::now() + Duration::from_secs(60) });
     Ok(Response::builder().header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8).body(Body::from(response_body)).unwrap())
 }
 
 // Перезагружаем конфигурацию каждые 60 секунд
-async fn reload_config(state: Arc<ProxyState>, tx: tokio::sync::mpsc::Sender<Config>) {
+async fn reload_config(state: Arc<ProxyState>) {  // Убираем tx, так как не перезапускаем сервер
     let mut current_config = state.config.lock().await.clone();
     loop {
         tokio::time::sleep(Duration::from_secs(60)).await; // Ждём минуту
         if let Ok(new_config) = load_config().await {
             if current_config != new_config && validate_config(&new_config).is_ok() { // Если конфигурация изменилась
-                info!("Обновление конфигурации: HTTP={}, HTTPS={}, QUIC={}", new_config.http_port, new_config.https_port, new_config.quic_port);
+                info!("Обновление конфигурации: HTTP={}, HTTPS={}, QUIC={}", 
+                      new_config.http_port, new_config.https_port, new_config.quic_port);
                 *state.config.lock().await = new_config.clone();
-                if tx.send(new_config.clone()).await.is_err() { // Отправляем новую конфигурацию
-                    error!("Ошибка отправки конфигурации");
-                    break;
-                }
+                // Обновляем локации
+                let mut locations = state.locations.write().await;
+                *locations = new_config.locations.clone();
+                info!("Локации обновлены: {:?}", locations);
                 current_config = new_config;
             }
         }
@@ -464,20 +482,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rate_limits: DashMap::new(),
             config: TokioMutex::new(initial_config.clone()),
             webrtc_peers: DashMap::new(),
+            locations: Arc::new(RwLock::new(initial_config.locations.clone())), // Инициализируем локации
         });
 
-        let (config_tx, mut config_rx) = tokio::sync::mpsc::channel::<Config>(10); // Канал для обновления конфигурации
-        let (mut http_shutdown_tx, http_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (mut https_shutdown_tx, https_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (mut quic_shutdown_tx, quic_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+		let (_, mut config_rx) = tokio::sync::mpsc::channel::<Config>(10); // Игнорируем Sender, берём только Receiver
+		let (mut http_shutdown_tx, http_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+		let (mut https_shutdown_tx, https_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+		let (mut quic_shutdown_tx, quic_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
 
         // Запускаем все серверы
         tokio::spawn(run_http_server(initial_config.clone(), http_shutdown_rx));
         tokio::spawn(run_https_server(state.clone(), initial_config.clone(), https_shutdown_rx));
         tokio::spawn(run_quic_server(initial_config, quic_shutdown_rx));
-        tokio::spawn(reload_config(state.clone(), config_tx));
+        tokio::spawn(reload_config(state.clone())); // Передаём только state, без tx
 
-        // Обрабатываем обновления конфигурации
+        // Обрабатываем обновления конфигурации (оставляем для совместимости, но теперь не обязательно)
         while let Some(new_config) = config_rx.recv().await {
             let _ = http_shutdown_tx.send(()).await;
             let _ = https_shutdown_tx.send(()).await;
