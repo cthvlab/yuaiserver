@@ -1,218 +1,265 @@
-use hyper::{Body, Request, Response, Server, header, service::{make_service_fn, service_fn}, StatusCode};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::ServerConfig;
-use dashmap::DashMap;
-use std::collections::{HashMap, HashSet};
-use std::convert::Infallible;
-use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use std::fs::File;
-use std::io::BufReader;
-use tokio::sync::{Mutex as TokioMutex, RwLock};
-use tokio::net::TcpListener;
-use tokio::time::sleep;
-use tokio_tungstenite::WebSocketStream;
-use tungstenite::protocol::Role;
-use tracing::{error, info, warn};
-use tracing_subscriber;
-use jsonwebtoken::{decode, DecodingKey, Validation};
-use serde::Deserialize;
-use base64::engine::general_purpose;
-use base64::Engine;
-use quinn::{Endpoint, ServerConfig as QuinnServerConfig, Connection};
-use futures::SinkExt;
-use rustls_pemfile::{certs, pkcs8_private_keys};
-use webrtc::api::APIBuilder;
-use webrtc::peer_connection::RTCPeerConnection;
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use tokio_rustls::TlsAcceptor;
-use hyper::upgrade::Upgraded;
+use hyper::{Body, Request, Response, Server, header, service::{make_service_fn, service_fn}, StatusCode}; // Библиотеки для HTTP/HTTPS сервера
+use rustls::pki_types::{CertificateDer, PrivateKeyDer}; // Типы данных для работы с сертификатами
+use rustls::ServerConfig; // Конфигурация для защищённых соединений
+use dashmap::DashMap; // Быстрая структура данных для многопоточной работы (как словарь)
+use std::collections::HashMap; // Обычный словарь
+use std::convert::Infallible; // Тип для обработки ошибок, которые не должны случаться
+use std::net::{IpAddr, SocketAddr}; // Типы для работы с адресами в сети
+use std::sync::Arc; // Инструмент для безопасного использования данных в разных потоках
+use std::time::{Duration, Instant}; // Для работы со временем
+use std::fs::File; // Для работы с файлами
+use std::io::BufReader; // Помогает читать файлы
+use tokio::sync::Mutex as TokioMutex; // Замок для безопасной работы с данными в асинхронном коде
+use tokio::net::TcpListener; // Слушатель для TCP соединений
+use tokio::time::sleep; // Асинхронный "сон" (ждать какое-то время)
+use tokio_tungstenite::WebSocketStream; // Для работы с WebSocket
+use tungstenite::protocol::Role; // Роли для WebSocket (сервер или клиент)
+use tracing::{error, info, warn}; // Логирование (запись сообщений о работе программы)
+use tracing_subscriber; // Настройка логирования
+use jsonwebtoken::{decode, DecodingKey, Validation}; // Проверка JWT токенов
+use serde::Deserialize; // Преобразование текста (TOML) в структуры Rust
+use base64::engine::general_purpose; // Кодирование и декодирование Base64
+use base64::Engine; // Движок для Base64
+use quinn::{Endpoint, ServerConfig as QuinnServerConfig, Connection}; // QUIC протокол
+use futures::SinkExt; // Для отправки данных в потоках
+use rustls_pemfile::{certs, pkcs8_private_keys}; // Чтение сертификатов и ключей из файлов
+use webrtc::api::APIBuilder; // WebRTC для видеосвязи и данных
+use webrtc::peer_connection::RTCPeerConnection; // Соединение WebRTC
+use webrtc::peer_connection::sdp::session_description::RTCSessionDescription; // Описание сессии WebRTC
+use webrtc::ice_transport::ice_server::RTCIceServer; // ICE серверы для WebRTC
+use tokio_rustls::TlsAcceptor; // Приём TLS соединений
+use hyper::upgrade::Upgraded; // Обновление соединения для WebSocket
 
+// Константа для типа ответа (текст в формате UTF-8)
 const CONTENT_TYPE_UTF8: &str = "text/plain; charset=utf-8";
 
+// Структура для хранения настроек сервера из config.toml
 #[derive(Deserialize, Clone, PartialEq)]
 struct Config {
-    http_port: u16,
-    https_port: u16,
-    quic_port: u16,
-    cert_path: String,
-    key_path: String,
-    jwt_secret: String,
-    basic_auth_login: String,
-    basic_auth_password: String,
+    http_port: u16,             // Порт для HTTP
+    https_port: u16,            // Порт для HTTPS
+    quic_port: u16,             // Порт для QUIC
+    cert_path: String,          // Путь к сертификату
+    key_path: String,           // Путь к ключу
+    jwt_secret: String,         // Секрет для JWT
+    basic_auth_login: String,   // Логин для авторизации
+    basic_auth_password: String,// Пароль для авторизации
+    worker_threads: usize,      // Количество потоков для обработки задач
 }
 
+// Структура для хранения записи в кэше (ответа сервера)
 #[derive(Clone)]
 struct CacheEntry {
-    response_body: Vec<u8>,
-    expiry: Instant,
+    response_body: Vec<u8>, // Сами данные ответа
+    expiry: Instant,        // Время, когда запись устареет
 }
 
+// Структура для кэширования авторизации
+#[derive(Clone)]
+struct AuthCacheEntry {
+    is_valid: bool,   // Прошёл ли пользователь проверку
+    expiry: Instant,  // Время, когда запись устареет
+}
+
+// Главная структура, которая хранит состояние сервера
 struct ProxyState {
-    cache: DashMap<String, CacheEntry>,
-    whitelist: RwLock<HashSet<String>>,
-    blacklist: RwLock<HashSet<String>>,
-    sessions: TokioMutex<HashMap<String, Instant>>,
-    auth_attempts: TokioMutex<HashMap<String, (u32, Instant)>>,
-    rate_limits: TokioMutex<HashMap<String, (Instant, u32)>>,
-    config: TokioMutex<Config>,
-    webrtc_peers: TokioMutex<HashMap<String, Arc<RTCPeerConnection>>>,
+    cache: DashMap<String, CacheEntry>,                // Кэш для быстрых ответов
+    auth_cache: DashMap<String, AuthCacheEntry>,       // Кэш авторизаций
+    whitelist: DashMap<String, ()>,                    // Белый список IP
+    blacklist: DashMap<String, ()>,                    // Чёрный список IP
+    sessions: DashMap<String, Instant>,                // Сессии пользователей
+    auth_attempts: DashMap<String, (u32, Instant)>,    // Попытки авторизации
+    rate_limits: DashMap<String, (Instant, u32)>,      // Лимиты запросов
+    config: TokioMutex<Config>,                        // Настройки сервера (с замком для безопасности)
+    webrtc_peers: DashMap<String, Arc<RTCPeerConnection>>, // WebRTC соединения
 }
 
-// Загружает конфигурацию из файла config.toml
-fn load_config() -> Result<Config, String> {
-    let file = File::open("config.toml").map_err(|e| format!("Не удалось открыть config.toml: {}", e))?;
-    let content = std::io::read_to_string(BufReader::new(file)).map_err(|e| format!("Ошибка чтения: {}", e))?;
-    toml::from_str(&content).map_err(|e| format!("Ошибка парсинга: {}", e))
+// Функция для загрузки настроек из файла config.toml
+async fn load_config() -> Result<Config, String> {
+    let content = tokio::fs::read_to_string("config.toml").await // Читаем содержимое файла напрямую по пути
+        .map_err(|e| format!("Ошибка чтения config.toml: {}", e))?;
+    toml::from_str(&content) // Преобразуем текст в структуру Config
+        .map_err(|e| format!("Ошибка парсинга: {}", e))
 }
 
-// Проверяет корректность конфигурации (порты и наличие сертификатов)
+// Проверяем, что настройки корректны
 fn validate_config(config: &Config) -> Result<(), String> {
+    // Проверяем, что порты не совпадают
     if config.http_port == config.https_port || config.http_port == config.quic_port || config.https_port == config.quic_port {
         return Err(format!("Конфликт портов: HTTP={}, HTTPS={}, QUIC={}", config.http_port, config.https_port, config.quic_port));
     }
+    // Проверяем, что файлы сертификата и ключа существуют
     if !std::path::Path::new(&config.cert_path).exists() || !std::path::Path::new(&config.key_path).exists() {
         return Err("Сертификат или ключ не найден".to_string());
     }
+    // Проверяем, что количество потоков в пределах нормы (от 1 до 1024)
+    if config.worker_threads == 0 || config.worker_threads > 1024 {
+        return Err("Недопустимое количество потоков: должно быть от 1 до 1024".to_string());
+    }
+    // Проверяем TLS настройки
     load_tls_config(config).map_err(|e| format!("Ошибка TLS конфигурации: {}", e))?;
     Ok(())
 }
 
-// Загружает TLS конфигурацию для HTTPS сервера из файлов сертификата и ключа
+// Загружаем настройки для защищённых соединений (TLS)
 fn load_tls_config(config: &Config) -> Result<ServerConfig, Box<dyn std::error::Error>> {
-    let certs = certs(&mut BufReader::new(File::open(&config.cert_path)?))?.into_iter().map(CertificateDer::from).collect();
-    let key = pkcs8_private_keys(&mut BufReader::new(File::open(&config.key_path)?))?.into_iter().next().ok_or("Приватный ключ не найден")?;
-    let mut cfg = ServerConfig::builder().with_no_client_auth().with_single_cert(certs, PrivateKeyDer::Pkcs8(key.into()))?;
-    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let certs = certs(&mut BufReader::new(File::open(&config.cert_path)?))?.into_iter().map(CertificateDer::from).collect(); // Читаем сертификаты
+    let key = pkcs8_private_keys(&mut BufReader::new(File::open(&config.key_path)?))?.into_iter().next().ok_or("Приватный ключ не найден")?; // Читаем ключ
+    let mut cfg = ServerConfig::builder().with_no_client_auth().with_single_cert(certs, PrivateKeyDer::Pkcs8(key.into()))?; // Создаём конфигурацию TLS
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()]; // Поддерживаем HTTP/2 и HTTP/1.1
     Ok(cfg)
 }
 
-// Загружает конфигурацию для QUIC сервера из файлов сертификата и ключа
+// Настраиваем QUIC соединения
 fn load_quinn_config(config: &Config) -> QuinnServerConfig {
     let certs = certs(&mut BufReader::new(File::open(&config.cert_path).unwrap())).unwrap().into_iter().map(CertificateDer::from).collect();
     let key = pkcs8_private_keys(&mut BufReader::new(File::open(&config.key_path).unwrap())).unwrap().into_iter().next().unwrap();
     QuinnServerConfig::with_single_cert(certs, PrivateKeyDer::Pkcs8(key.into())).unwrap()
 }
 
-// Проверяет авторизацию клиента (Basic Auth или JWT), добавляет IP в чёрный список при превышении попыток
+// Проверяем авторизацию пользователя
 async fn check_auth(req: &Request<Body>, state: &ProxyState, ip: &str) -> Result<(), Response<Body>> {
-    let config = state.config.lock().await;
-    let auth_header = req.headers().get("Authorization").and_then(|h| h.to_str().ok());
+    // Сначала проверяем, есть ли данные в кэше авторизации
+    if let Some(entry) = state.auth_cache.get(ip) {
+        if entry.expiry > Instant::now() { // Если кэш ещё действителен
+            if entry.is_valid {
+                return Ok(()); // Пользователь уже проверен, всё ок
+            } else {
+                return Err(Response::builder().header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8).body(Body::from("Неавторизован")).unwrap());
+            }
+        }
+    }
+
+    let config = state.config.lock().await; // Блокируем конфигурацию для чтения
+    let auth_header = req.headers().get("Authorization").and_then(|h| h.to_str().ok()); // Получаем заголовок авторизации
+
+    // Проверяем базовую авторизацию (Basic Auth)
     let is_basic_auth = auth_header.map(|auth| {
         auth.starts_with("Basic ") && general_purpose::STANDARD.decode(auth.trim_start_matches("Basic ")).ok()
             .and_then(|d| String::from_utf8(d).ok())
             .map(|cred| cred == format!("{}:{}", config.basic_auth_login, config.basic_auth_password))
             .unwrap_or(false)
     }).unwrap_or(false);
+
+    // Проверяем JWT токен
     let is_jwt_auth = auth_header.map(|auth| {
         auth.starts_with("Bearer ") && decode::<HashMap<String, String>>(auth.trim_start_matches("Bearer "), &DecodingKey::from_secret(config.jwt_secret.as_ref()), &Validation::default()).is_ok()
     }).unwrap_or(false);
 
+    // Если ни одна проверка не прошла
     if !is_basic_auth && !is_jwt_auth {
-        let mut attempts = state.auth_attempts.lock().await;
         let now = Instant::now();
-        let entry = attempts.entry(ip.to_string()).or_insert((0, now));
-        if now.duration_since(entry.1) < Duration::from_secs(60) {
-            entry.0 += 1;
-            if entry.0 >= 5 {
-                state.blacklist.write().await.insert(ip.to_string());
-                attempts.remove(ip);
+        let mut entry = state.auth_attempts.entry(ip.to_string()).or_insert((0, now)); // Записываем попытку авторизации
+        if now.duration_since(entry.1) < Duration::from_secs(60) { // Если в течение минуты
+            entry.0 += 1; // Увеличиваем счётчик попыток
+            if entry.0 >= 5 { // Если слишком много попыток
+                state.blacklist.insert(ip.to_string(), ()); // Добавляем в чёрный список
+                state.auth_attempts.remove(ip);
                 warn!("IP {} добавлен в чёрный список", ip);
+                state.auth_cache.insert(ip.to_string(), AuthCacheEntry { is_valid: false, expiry: Instant::now() + Duration::from_secs(60) });
                 return Err(Response::builder().header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8).body(Body::from("Доступ запрещён")).unwrap());
             }
         } else {
-            *entry = (1, now);
+            *entry = (1, now); // Сбрасываем счётчик
         }
+        state.auth_cache.insert(ip.to_string(), AuthCacheEntry { is_valid: false, expiry: Instant::now() + Duration::from_secs(60) });
         return Err(Response::builder().header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8).body(Body::from("Неавторизован")).unwrap());
     }
+    // Если авторизация прошла, кэшируем результат
+    state.auth_cache.insert(ip.to_string(), AuthCacheEntry { is_valid: true, expiry: Instant::now() + Duration::from_secs(60) });
     Ok(())
 }
 
-// Получает IP клиента из заголовка X-Forwarded-For или адреса соединения
+// Получаем IP клиента из заголовков или соединения
 fn get_client_ip(req: &Request<Body>, client_ip: Option<IpAddr>) -> Option<String> {
     req.headers().get("X-Forwarded-For").and_then(|v| v.to_str().ok()).and_then(|s| s.split(',').next()).map(|s| s.trim().to_string()).or_else(|| client_ip.map(|ip| ip.to_string()))
 }
 
-// Обрабатывает WebSocket соединение, отправляя и получая сообщения
+// Обрабатываем WebSocket соединение
 async fn handle_websocket(upgraded: Upgraded) {
-    let mut ws = WebSocketStream::from_raw_socket(upgraded, Role::Server, None).await;
-    while let Some(msg) = tokio_stream::StreamExt::next(&mut ws).await {
+    let mut ws = WebSocketStream::from_raw_socket(upgraded, Role::Server, None).await; // Преобразуем соединение в WebSocket
+    while let Some(msg) = tokio_stream::StreamExt::next(&mut ws).await { // Ждём сообщений
         if let Ok(msg) = msg {
-            if msg.is_text() || msg.is_binary() {
-                ws.send(msg).await.unwrap_or_else(|e| error!("Ошибка WebSocket: {}", e));
+            if msg.is_text() || msg.is_binary() { // Если это текст или данные
+                ws.send(msg).await.unwrap_or_else(|e| error!("Ошибка WebSocket: {}", e)); // Отправляем обратно
             }
         }
     }
 }
 
-// Обновляет или создаёт сессию для указанного IP
+// Управляем сессией пользователя
 async fn manage_session(state: &ProxyState, ip: &str) {
-    let mut sessions = state.sessions.lock().await;
-    sessions.insert(ip.to_string(), Instant::now());
+    state.sessions.insert(ip.to_string(), Instant::now()); // Записываем время начала сессии
 }
 
-// Проверяет лимит запросов для IP, возвращает true, если запрос разрешён
+// Проверяем лимит запросов
 async fn check_rate_limit(state: &ProxyState, ip: &str, max_requests: u32) -> bool {
-    let mut limits = state.rate_limits.lock().await;
     let now = Instant::now();
-    let entry = limits.entry(ip.to_string()).or_insert((now, 0));
-    if now.duration_since(entry.0) > Duration::from_secs(60) {
-        *entry = (now, 1);
+    let mut entry = state.rate_limits.entry(ip.to_string()).or_insert((now, 0)); // Получаем или создаём запись
+    if now.duration_since(entry.0) > Duration::from_secs(60) { // Если прошла минута
+        *entry = (now, 1); // Сбрасываем счётчик
         true
-    } else if entry.1 < max_requests {
-        entry.1 += 1;
+    } else if entry.1 < max_requests { // Если лимит не превышен
+        entry.1 += 1; // Увеличиваем счётчик
         true
     } else {
-        false
+        false // Лимит превышен
     }
 }
 
-// Обрабатывает WebRTC предложение, создаёт соединение и возвращает ответное SDP
+// Обрабатываем WebRTC запрос
 async fn handle_webrtc_offer(offer_sdp: String, state: Arc<ProxyState>, client_ip: String) -> Result<String, String> {
-    let api = APIBuilder::new().build();
-    let peer_connection = Arc::new(api.new_peer_connection(Default::default()).await.map_err(|e| e.to_string())?);
-    let data_channel = peer_connection.create_data_channel("proxy", None).await.map_err(|e| e.to_string())?;
-    let offer = RTCSessionDescription::offer(offer_sdp).map_err(|e| format!("Ошибка SDP: {}", e))?;
-    peer_connection.set_remote_description(offer).await.map_err(|e| e.to_string())?;
-    let answer = peer_connection.create_answer(None).await.map_err(|e| e.to_string())?;
-    peer_connection.set_local_description(answer.clone()).await.map_err(|e| e.to_string())?;
-    state.webrtc_peers.lock().await.insert(client_ip.clone(), peer_connection.clone());
-    data_channel.on_message(Box::new(move |msg| {
+    let api = APIBuilder::new().build(); // Создаём API для WebRTC
+    let config = webrtc::peer_connection::configuration::RTCConfiguration {
+        ice_servers: vec![RTCIceServer { // Добавляем STUN сервер Google
+            urls: vec!["stun:stun.l.google.com:19302".to_string()],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let peer_connection = Arc::new(api.new_peer_connection(config).await.map_err(|e| e.to_string())?); // Создаём соединение
+    let data_channel = peer_connection.create_data_channel("proxy", None).await.map_err(|e| e.to_string())?; // Создаём канал данных
+    let offer = RTCSessionDescription::offer(offer_sdp).map_err(|e| format!("Ошибка SDP: {}", e))?; // Парсим запрос клиента
+    peer_connection.set_remote_description(offer).await.map_err(|e| e.to_string())?; // Устанавливаем описание
+    let answer = peer_connection.create_answer(None).await.map_err(|e| e.to_string())?; // Создаём ответ
+    peer_connection.set_local_description(answer.clone()).await.map_err(|e| e.to_string())?; // Устанавливаем локальное описание
+    state.webrtc_peers.insert(client_ip.clone(), peer_connection.clone()); // Сохраняем соединение
+    data_channel.on_message(Box::new(move |msg| { // Обрабатываем сообщения
         info!("WebRTC данные от {}: {:?}", client_ip, msg.data.to_vec());
         Box::pin(async move {})
     }));
-    Ok(answer.sdp)
+    Ok(answer.sdp) // Возвращаем SDP ответ
 }
 
-// Обрабатывает HTTP запрос, перенаправляя на HTTPS
+// Обрабатываем HTTP запросы (перенаправляем на HTTPS)
 async fn handle_http_request(req: Request<Body>, https_port: u16) -> Result<Response<Body>, Infallible> {
     let redirect_url = format!("https://{}:{}{}", req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("127.0.0.1"), https_port, req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or(""));
     Ok(Response::builder().status(StatusCode::MOVED_PERMANENTLY).header(header::LOCATION, redirect_url).body(Body::empty()).unwrap())
 }
 
-// Обрабатывает HTTPS запросы, включая авторизацию, лимиты, WebSocket и WebRTC
+// Обрабатываем HTTPS запросы
 async fn handle_https_request(req: Request<Body>, state: Arc<ProxyState>, client_ip: Option<IpAddr>) -> Result<Response<Body>, Infallible> {
-    let ip = match get_client_ip(&req, client_ip) {
+    let ip = match get_client_ip(&req, client_ip) { // Получаем IP клиента
         Some(ip) => ip,
         None => return Ok(Response::builder().header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8).body(Body::from("IP не определён")).unwrap()),
     };
 
-    if state.blacklist.read().await.contains(&ip) {
+    if state.blacklist.contains_key(&ip) { // Проверяем чёрный список
         return Ok(Response::builder().header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8).body(Body::from("Доступ запрещён")).unwrap());
     }
 
-    if let Err(resp) = check_auth(&req, &state, &ip).await {
+    if let Err(resp) = check_auth(&req, &state, &ip).await { // Проверяем авторизацию
         return Ok(resp);
     }
 
-    manage_session(&state, &ip).await;
+    manage_session(&state, &ip).await; // Управляем сессией
 
-    let max_requests = if state.whitelist.read().await.contains(&ip) { 100 } else { 10 };
-    if !check_rate_limit(&state, &ip, max_requests).await {
+    let max_requests = if state.whitelist.contains_key(&ip) { 100 } else { 10 }; // Устанавливаем лимит запросов
+    if !check_rate_limit(&state, &ip, max_requests).await { // Проверяем лимит
         return Ok(Response::builder().header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8).body(Body::from("Превышен лимит запросов")).unwrap());
     }
 
+    // Если запрос на WebSocket
     if req.headers().get("Upgrade").map(|v| v == "websocket").unwrap_or(false) {
         if let Ok(upgraded) = hyper::upgrade::on(req).await {
             tokio::spawn(handle_websocket(upgraded));
@@ -221,6 +268,7 @@ async fn handle_https_request(req: Request<Body>, state: Arc<ProxyState>, client
         return Ok(Response::builder().status(500).header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8).body(Body::from("Ошибка WebSocket")).unwrap());
     }
 
+    // Если запрос на WebRTC
     if req.uri().path() == "/webrtc/offer" {
         let offer_sdp = String::from_utf8_lossy(&hyper::body::to_bytes(req.into_body()).await.unwrap()).to_string();
         match handle_webrtc_offer(offer_sdp, state.clone(), ip).await {
@@ -229,6 +277,7 @@ async fn handle_https_request(req: Request<Body>, state: Arc<ProxyState>, client
         }
     }
 
+    // Проверяем кэш для обычного запроса
     let url = req.uri().to_string();
     if let Some(entry) = state.cache.get(&url) {
         if entry.expiry > Instant::now() {
@@ -236,21 +285,22 @@ async fn handle_https_request(req: Request<Body>, state: Arc<ProxyState>, client
         }
     }
 
+    // Отправляем ответ и кэшируем его
     let response_body = "Добро пожаловать (HTTPS)".as_bytes().to_vec();
     state.cache.insert(url, CacheEntry { response_body: response_body.clone(), expiry: Instant::now() + Duration::from_secs(60) });
     Ok(Response::builder().header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8).body(Body::from(response_body)).unwrap())
 }
 
-// Периодически проверяет и обновляет конфигурацию из файла
+// Перезагружаем конфигурацию каждые 60 секунд
 async fn reload_config(state: Arc<ProxyState>, tx: tokio::sync::mpsc::Sender<Config>) {
     let mut current_config = state.config.lock().await.clone();
     loop {
-        sleep(Duration::from_secs(60)).await;
-        if let Ok(new_config) = load_config() {
-            if current_config != new_config && validate_config(&new_config).is_ok() {
+        tokio::time::sleep(Duration::from_secs(60)).await; // Ждём минуту
+        if let Ok(new_config) = load_config().await {
+            if current_config != new_config && validate_config(&new_config).is_ok() { // Если конфигурация изменилась
                 info!("Обновление конфигурации: HTTP={}, HTTPS={}, QUIC={}", new_config.http_port, new_config.https_port, new_config.quic_port);
                 *state.config.lock().await = new_config.clone();
-                if tx.send(new_config.clone()).await.is_err() {
+                if tx.send(new_config.clone()).await.is_err() { // Отправляем новую конфигурацию
                     error!("Ошибка отправки конфигурации");
                     break;
                 }
@@ -260,13 +310,13 @@ async fn reload_config(state: Arc<ProxyState>, tx: tokio::sync::mpsc::Sender<Con
     }
 }
 
-// Обрабатывает QUIC соединение, принимая и отправляя данные
+// Обрабатываем QUIC соединение
 async fn handle_quic_connection(connection: Connection) {
     info!("QUIC соединение от {:?}", connection.remote_address());
     loop {
-        if let Ok((mut send, mut recv)) = connection.accept_bi().await {
+        if let Ok((mut send, mut recv)) = connection.accept_bi().await { // Принимаем двусторонний поток
             tokio::spawn(async move {
-                let mut buffer = vec![0; 1024];
+                let mut buffer = vec![0; 4096]; // Буфер для чтения данных
                 if let Ok(Some(n)) = recv.read(&mut buffer).await {
                     let response = format!("QUIC ответ: {}", String::from_utf8_lossy(&buffer[..n]));
                     send.write_all(response.as_bytes()).await.unwrap_or_else(|e| error!("Ошибка QUIC: {}", e));
@@ -278,7 +328,7 @@ async fn handle_quic_connection(connection: Connection) {
     }
 }
 
-// Запускает сервер (HTTP или HTTPS) с graceful shutdown
+// Запускаем сервер с обработкой запросов
 async fn run_server<F, Fut>(addr: SocketAddr, service: F, mut shutdown_rx: tokio::sync::mpsc::Receiver<()>) -> Result<(), Box<dyn std::error::Error>>
 where
     F: Fn(Request<Body>) -> Fut + Send + Clone + 'static,
@@ -298,11 +348,11 @@ where
     }
 }
 
-// Запускает все серверы (HTTP, HTTPS, QUIC) с новыми каналами завершения
+// Запускаем все серверы
 async fn start_servers(state: Arc<ProxyState>, config: Config, http_tx: &mut tokio::sync::mpsc::Sender<()>, https_tx: &mut tokio::sync::mpsc::Sender<()>, quic_tx: &mut tokio::sync::mpsc::Sender<()>) {
-    let (http_shutdown_tx, http_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let (https_shutdown_tx, https_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let (quic_shutdown_tx, quic_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let (http_shutdown_tx, http_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1); // Канал для остановки HTTP
+    let (https_shutdown_tx, https_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1); // Канал для остановки HTTPS
+    let (quic_shutdown_tx, quic_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1); // Канал для остановки QUIC
 
     tokio::spawn(run_http_server(config.clone(), http_shutdown_rx));
     tokio::spawn(run_https_server(state.clone(), config.clone(), https_shutdown_rx));
@@ -313,23 +363,24 @@ async fn start_servers(state: Arc<ProxyState>, config: Config, http_tx: &mut tok
     *quic_tx = quic_shutdown_tx;
 }
 
-// Запускает HTTP сервер с перенаправлением на HTTPS
+// HTTP сервер
 async fn run_http_server(config: Config, shutdown_rx: tokio::sync::mpsc::Receiver<()>) {
     let addr = SocketAddr::from(([127, 0, 0, 1], config.http_port));
     let service = move |req: Request<Body>| handle_http_request(req, config.https_port);
     run_server(addr, service, shutdown_rx).await.unwrap_or_else(|e| error!("Ошибка HTTP: {}", e));
 }
 
-// Запускает HTTPS сервер с обработкой TLS соединений
+// HTTPS сервер
 async fn run_https_server(state: Arc<ProxyState>, config: Config, mut shutdown_rx: tokio::sync::mpsc::Receiver<()>) {
     let addr = SocketAddr::from(([127, 0, 0, 1], config.https_port));
-    let tls_acceptor = TlsAcceptor::from(Arc::new(load_tls_config(&config).unwrap()));
-    let listener = TcpListener::bind(addr).await.unwrap();
+    let listener = TcpListener::bind(addr).await.unwrap(); // Слушаем входящие соединения
     info!("HTTPS сервер слушает на {}", listener.local_addr().unwrap());
 
+    let tls_acceptor = TlsAcceptor::from(Arc::new(load_tls_config(&config).unwrap())); // Настраиваем TLS
     loop {
         tokio::select! {
-            Ok((stream, client_ip)) = listener.accept() => {
+            Ok((stream, client_ip)) = listener.accept() => { // Принимаем соединение
+                stream.set_nodelay(true).unwrap(); // Ускоряем соединение
                 let state = state.clone();
                 let acceptor = tls_acceptor.clone();
                 tokio::spawn(async move {
@@ -362,10 +413,10 @@ async fn run_https_server(state: Arc<ProxyState>, config: Config, mut shutdown_r
     }
 }
 
-// Запускает QUIC сервер с обработкой соединений
+// QUIC сервер
 async fn run_quic_server(config: Config, mut shutdown_rx: tokio::sync::mpsc::Receiver<()>) {
     let addr = SocketAddr::from(([127, 0, 0, 1], config.quic_port));
-    let endpoint = Endpoint::server(load_quinn_config(&config), addr).unwrap();
+    let endpoint = Endpoint::server(load_quinn_config(&config), addr).unwrap(); // Запускаем QUIC
     info!("QUIC сервер слушает на {}", endpoint.local_addr().unwrap());
     loop {
         tokio::select! {
@@ -381,47 +432,65 @@ async fn run_quic_server(config: Config, mut shutdown_rx: tokio::sync::mpsc::Rec
     }
 }
 
-// Главная функция, инициализирует и запускает серверы
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    rustls::crypto::ring::default_provider().install_default().expect("Ошибка CryptoProvider");
-    tracing_subscriber::fmt::init();
+// Главная функция программы
+// Главная функция программы
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    rustls::crypto::ring::default_provider().install_default().expect("Ошибка CryptoProvider"); // Настраиваем шифрование
+    tracing_subscriber::fmt::init(); // Включаем логирование
 
-    let initial_config = load_config().and_then(|cfg| validate_config(&cfg).map(|_| cfg)).map_err(|e| {
-        error!("Ошибка начальной конфигурации: {}", e);
-        "Некорректная конфигурация"
+    // Загружаем начальную конфигурацию
+    let initial_config = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        load_config().await.and_then(|cfg| validate_config(&cfg).map(|_| cfg)).map_err(|e| {
+            error!("Ошибка начальной конфигурации: {}", e);
+            "Некорректная конфигурация"
+        })
     })?;
 
-    let state = Arc::new(ProxyState {
-        cache: DashMap::new(),
-        whitelist: RwLock::new(HashSet::new()),
-        blacklist: RwLock::new(HashSet::new()),
-        sessions: TokioMutex::new(HashMap::new()),
-        auth_attempts: TokioMutex::new(HashMap::new()),
-        rate_limits: TokioMutex::new(HashMap::new()),
-        config: TokioMutex::new(initial_config.clone()),
-        webrtc_peers: TokioMutex::new(HashMap::new()),
-    });
+    // Создаём runtime с количеством потоков из конфигурации
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(initial_config.worker_threads) // Устанавливаем количество потоков
+        .enable_all() // Включаем все возможности Tokio
+        .build()
+        .unwrap();
 
-    let (config_tx, mut config_rx) = tokio::sync::mpsc::channel::<Config>(10);
-    let (mut http_shutdown_tx, http_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let (mut https_shutdown_tx, https_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let (mut quic_shutdown_tx, quic_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+    // Запускаем сервер в нашем runtime
+    runtime.block_on(async {
+        let state = Arc::new(ProxyState {
+            cache: DashMap::new(),
+            auth_cache: DashMap::new(),
+            whitelist: DashMap::new(),
+            blacklist: DashMap::new(),
+            sessions: DashMap::new(),
+            auth_attempts: DashMap::new(),
+            rate_limits: DashMap::new(),
+            config: TokioMutex::new(initial_config.clone()),
+            webrtc_peers: DashMap::new(),
+        });
 
-    tokio::spawn(run_http_server(initial_config.clone(), http_shutdown_rx));
-    tokio::spawn(run_https_server(state.clone(), initial_config.clone(), https_shutdown_rx));
-    tokio::spawn(run_quic_server(initial_config, quic_shutdown_rx));
-    tokio::spawn(reload_config(state.clone(), config_tx));
+        let (config_tx, mut config_rx) = tokio::sync::mpsc::channel::<Config>(10); // Канал для обновления конфигурации
+        let (mut http_shutdown_tx, http_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (mut https_shutdown_tx, https_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (mut quic_shutdown_tx, quic_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
 
-    while let Some(new_config) = config_rx.recv().await {
-        let _ = http_shutdown_tx.send(()).await;
-        let _ = https_shutdown_tx.send(()).await;
-        let _ = quic_shutdown_tx.send(()).await;
-        sleep(Duration::from_secs(1)).await;
-        start_servers(state.clone(), new_config, &mut http_shutdown_tx, &mut https_shutdown_tx, &mut quic_shutdown_tx).await;
-    }
+        // Запускаем все серверы
+        tokio::spawn(run_http_server(initial_config.clone(), http_shutdown_rx));
+        tokio::spawn(run_https_server(state.clone(), initial_config.clone(), https_shutdown_rx));
+        tokio::spawn(run_quic_server(initial_config, quic_shutdown_rx));
+        tokio::spawn(reload_config(state.clone(), config_tx));
 
-    tokio::signal::ctrl_c().await?;
-    info!("Сервер завершил работу");
+        // Обрабатываем обновления конфигурации
+        while let Some(new_config) = config_rx.recv().await {
+            let _ = http_shutdown_tx.send(()).await;
+            let _ = https_shutdown_tx.send(()).await;
+            let _ = quic_shutdown_tx.send(()).await;
+            sleep(Duration::from_secs(1)).await;
+            start_servers(state.clone(), new_config, &mut http_shutdown_tx, &mut https_shutdown_tx, &mut quic_shutdown_tx).await;
+        }
+
+        tokio::signal::ctrl_c().await?; // Ждём Ctrl+C для завершения
+        info!("Сервер завершил работу");
+        Ok::<(), Box<dyn std::error::Error>>(()) // Явно указываем тип ошибки
+    })?;
+
     Ok(())
 }
