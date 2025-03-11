@@ -1,9 +1,9 @@
-# Порт для HTTP соединений (обычно 8080)
-http_port = 8080
-# Порт для HTTPS соединений (обычно 8443)
-https_port = 8443
-# Порт для QUIC соединений (обычно 443)
-quic_port = 443
+# Порт для HTTP соединений (обычно 80)
+http_port = 80
+# Порт для HTTPS соединений (обычно 443)
+https_port = 443
+# Порт для QUIC соединений 
+quic_port = 444
 # Путь к файлу сертификата для защиты соединений
 cert_path = "cert.pem"
 # Путь к файлу ключа для сертификата
@@ -16,3 +16,16 @@ basic_auth_login = "admin"
 basic_auth_password = "password"
 # Количество потоков для обработки задач (зависит от процессора, обычно равно числу ядер)
 worker_threads = 16
+
+# Секция локаций
+[[locations]]
+path = "/"
+response = "Добро пожаловать на главную страницу!"
+
+[[locations]]
+path = "/api"
+response = "Это API endpoint"
+
+[[locations]]
+path = "/static"
+response = "Статические файлы здесь"
