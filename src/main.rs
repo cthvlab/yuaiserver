@@ -247,7 +247,6 @@ async fn handle_http_request(req: Request<Body>, https_port: u16) -> Result<Resp
 }
 
 // Обрабатываем HTTPS запросы
-// Обрабатываем HTTPS запросы
 async fn handle_https_request(req: Request<Body>, state: Arc<ProxyState>, client_ip: Option<IpAddr>) -> Result<Response<Body>, Infallible> {
     let ip = match get_client_ip(&req, client_ip) { // Получаем IP клиента
         Some(ip) => ip,
