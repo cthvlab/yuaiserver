@@ -433,7 +433,6 @@ async fn run_quic_server(config: Config, mut shutdown_rx: tokio::sync::mpsc::Rec
 }
 
 // Главная функция программы
-// Главная функция программы
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     rustls::crypto::ring::default_provider().install_default().expect("Ошибка CryptoProvider"); // Настраиваем шифрование
     tracing_subscriber::fmt::init(); // Включаем логирование
