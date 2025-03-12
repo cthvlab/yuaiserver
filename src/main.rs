@@ -11,7 +11,6 @@ use std::fs::File; // Для работы с файлами
 use std::io::BufReader; // Помогает читать файлы
 use tokio::sync::{Mutex as TokioMutex, RwLock}; // Замки для безопасной работы с данными в асинхронном коде
 use tokio::net::TcpListener; // Слушатель для TCP соединений
-use tokio::time::sleep; // Асинхронный "сон" (ждать какое-то время)
 use tokio_tungstenite::WebSocketStream; // Для работы с WebSocket
 use tungstenite::protocol::Role; // Роли для WebSocket (сервер или клиент)
 use tracing::{error, info, warn}; // Логирование (запись сообщений о работе программы)
@@ -357,107 +356,62 @@ async fn handle_quic_connection(connection: Connection) {
     }
 }
 
-// Запускаем сервер с обработкой запросов
-async fn run_server<F, Fut>(addr: SocketAddr, service: F, mut shutdown_rx: tokio::sync::mpsc::Receiver<()>) -> Result<(), Box<dyn std::error::Error>>
-where
-    F: Fn(Request<Body>) -> Fut + Send + Clone + 'static,
-    Fut: futures::Future<Output = Result<Response<Body>, Infallible>> + Send + 'static,
-{
+// HTTP сервер
+async fn run_http_server(config: Config) {
+    let addr = SocketAddr::from(([127, 0, 0, 1], config.http_port));
+    let service = move |req: Request<Body>| handle_http_request(req, config.https_port);
     let server = Server::bind(&addr).serve(make_service_fn(move |_| {
         let service = service.clone();
         async move { Ok::<_, Infallible>(service_fn(service)) }
     }));
-    info!("Сервер слушает на {}", addr);
-    tokio::select! {
-        result = server => result.map_err(|e| e.into()),
-        _ = shutdown_rx.recv() => {
-            info!("Сервер на {} завершил работу", addr);
-            Ok(())
-        }
-    }
-}
-
-// Запускаем все серверы
-async fn start_servers(state: Arc<ProxyState>, config: Config, http_tx: &mut tokio::sync::mpsc::Sender<()>, https_tx: &mut tokio::sync::mpsc::Sender<()>, quic_tx: &mut tokio::sync::mpsc::Sender<()>) {
-    let (http_shutdown_tx, http_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1); // Канал для остановки HTTP
-    let (https_shutdown_tx, https_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1); // Канал для остановки HTTPS
-    let (quic_shutdown_tx, quic_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1); // Канал для остановки QUIC
-
-    tokio::spawn(run_http_server(config.clone(), http_shutdown_rx));
-    tokio::spawn(run_https_server(state.clone(), config.clone(), https_shutdown_rx));
-    tokio::spawn(run_quic_server(config.clone(), quic_shutdown_rx));
-
-    *http_tx = http_shutdown_tx;
-    *https_tx = https_shutdown_tx;
-    *quic_tx = quic_shutdown_tx;
-}
-
-// HTTP сервер
-async fn run_http_server(config: Config, shutdown_rx: tokio::sync::mpsc::Receiver<()>) {
-    let addr = SocketAddr::from(([127, 0, 0, 1], config.http_port));
-    let service = move |req: Request<Body>| handle_http_request(req, config.https_port);
-    run_server(addr, service, shutdown_rx).await.unwrap_or_else(|e| error!("Ошибка HTTP: {}", e));
+    info!("HTTP сервер слушает на {}", addr);
+    server.await.unwrap_or_else(|e| error!("Ошибка HTTP: {}", e));
 }
 
 // HTTPS сервер
-async fn run_https_server(state: Arc<ProxyState>, config: Config, mut shutdown_rx: tokio::sync::mpsc::Receiver<()>) {
+async fn run_https_server(state: Arc<ProxyState>, config: Config) {
     let addr = SocketAddr::from(([127, 0, 0, 1], config.https_port));
     let listener = TcpListener::bind(addr).await.unwrap(); // Слушаем входящие соединения
     info!("HTTPS сервер слушает на {}", listener.local_addr().unwrap());
 
     let tls_acceptor = TlsAcceptor::from(Arc::new(load_tls_config(&config).unwrap())); // Настраиваем TLS
     loop {
-        tokio::select! {
-            Ok((stream, client_ip)) = listener.accept() => { // Принимаем соединение
-                stream.set_nodelay(true).unwrap(); // Ускоряем соединение
-                let state = state.clone();
-                let acceptor = tls_acceptor.clone();
-                tokio::spawn(async move {
-                    let tls_stream = match acceptor.accept(stream).await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            error!("Ошибка TLS handshake: {}", e);
-                            return;
-                        }
-                    };
-                    let service = move |req: Request<Body>| handle_https_request(req, state.clone(), Some(client_ip.ip()));
-                    if let Err(e) = Server::builder(hyper::server::accept::from_stream(
-                        tokio_stream::once(Ok::<_, std::io::Error>(tls_stream))
-                    ))
-                    .serve(make_service_fn(move |_| {
-                        let service = service.clone();
-                        async move { Ok::<_, Infallible>(service_fn(service)) }
-                    }))
-                    .await
-                    {
-                        error!("Ошибка HTTPS: {}", e);
+        if let Ok((stream, client_ip)) = listener.accept().await { // Принимаем соединение
+            stream.set_nodelay(true).unwrap(); // Ускоряем соединение
+            let state = state.clone();
+            let acceptor = tls_acceptor.clone();
+            tokio::spawn(async move {
+                let tls_stream = match acceptor.accept(stream).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("Ошибка TLS handshake: {}", e);
+                        return;
                     }
-                });
-            }
-            _ = shutdown_rx.recv() => {
-                info!("HTTPS сервер завершил работу");
-                break;
-            }
+                };
+                let service = move |req: Request<Body>| handle_https_request(req, state.clone(), Some(client_ip.ip()));
+                if let Err(e) = Server::builder(hyper::server::accept::from_stream(
+                    tokio_stream::once(Ok::<_, std::io::Error>(tls_stream))
+                ))
+                .serve(make_service_fn(move |_| {
+                    let service = service.clone();
+                    async move { Ok::<_, Infallible>(service_fn(service)) }
+                }))
+                .await
+                {
+                    error!("Ошибка HTTPS: {}", e);
+                }
+            });
         }
     }
 }
 
 // QUIC сервер
-async fn run_quic_server(config: Config, mut shutdown_rx: tokio::sync::mpsc::Receiver<()>) {
+async fn run_quic_server(config: Config) {
     let addr = SocketAddr::from(([127, 0, 0, 1], config.quic_port));
     let endpoint = Endpoint::server(load_quinn_config(&config), addr).unwrap(); // Запускаем QUIC
     info!("QUIC сервер слушает на {}", endpoint.local_addr().unwrap());
-    loop {
-        tokio::select! {
-            Some(conn) = endpoint.accept() => {
-                tokio::spawn(handle_quic_connection(conn.await.unwrap()));
-            }
-            _ = shutdown_rx.recv() => {
-                endpoint.close(0u32.into(), b"Shutting down");
-                info!("QUIC сервер завершил работу");
-                break;
-            }
-        }
+    while let Some(conn) = endpoint.accept().await {
+        tokio::spawn(handle_quic_connection(conn.await.unwrap()));
     }
 }
 
@@ -496,25 +450,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             locations: Arc::new(RwLock::new(initial_config.locations.clone())), // Инициализируем локации
         });
 
-		let (_, mut config_rx) = tokio::sync::mpsc::channel::<Config>(10); // Игнорируем Sender, берём только Receiver
-		let (mut http_shutdown_tx, http_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
-		let (mut https_shutdown_tx, https_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
-		let (mut quic_shutdown_tx, quic_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
-
         // Запускаем все серверы
-        tokio::spawn(run_http_server(initial_config.clone(), http_shutdown_rx));
-        tokio::spawn(run_https_server(state.clone(), initial_config.clone(), https_shutdown_rx));
-        tokio::spawn(run_quic_server(initial_config, quic_shutdown_rx));
+        tokio::spawn(run_http_server(initial_config.clone()));
+        tokio::spawn(run_https_server(state.clone(), initial_config.clone()));
+        tokio::spawn(run_quic_server(initial_config));
         tokio::spawn(reload_config(state.clone())); 
-
-        // Обрабатываем обновления конфигурации (оставляем для совместимости, но теперь не обязательно)
-        while let Some(new_config) = config_rx.recv().await {
-            let _ = http_shutdown_tx.send(()).await;
-            let _ = https_shutdown_tx.send(()).await;
-            let _ = quic_shutdown_tx.send(()).await;
-            sleep(Duration::from_secs(1)).await;
-            start_servers(state.clone(), new_config, &mut http_shutdown_tx, &mut https_shutdown_tx, &mut quic_shutdown_tx).await;
-        }
 
         tokio::signal::ctrl_c().await?; // Ждём Ctrl+C для завершения
         info!("Сервер завершил работу");
