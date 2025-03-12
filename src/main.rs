@@ -18,8 +18,6 @@ use tracing::{error, info, warn}; // Логирование (запись соо
 use tracing_subscriber; // Настройка логирования
 use jsonwebtoken::{decode, DecodingKey, Validation}; // Проверка JWT токенов
 use serde::Deserialize; // Преобразование текста (TOML) в структуры Rust
-use base64::engine::general_purpose; // Кодирование и декодирование Base64
-use base64::Engine; // Движок для Base64
 use quinn::{Endpoint, ServerConfig as QuinnServerConfig, Connection}; // QUIC протокол
 use futures::SinkExt; // Для отправки данных в потоках
 use rustls_pemfile::{certs, pkcs8_private_keys}; // Чтение сертификатов и ключей из файлов
@@ -49,8 +47,6 @@ struct Config {
     cert_path: String,          // Путь к сертификату
     key_path: String,           // Путь к ключу
     jwt_secret: String,         // Секрет для JWT
-    basic_auth_login: String,   // Логин для авторизации
-    basic_auth_password: String,// Пароль для авторизации
     worker_threads: usize,      // Количество потоков для обработки задач
     locations: Vec<Location>,   // Список локаций
 }
@@ -130,52 +126,68 @@ fn load_quinn_config(config: &Config) -> QuinnServerConfig {
 async fn check_auth(req: &Request<Body>, state: &ProxyState, ip: &str) -> Result<(), Response<Body>> {
     // Сначала проверяем, есть ли данные в кэше авторизации
     if let Some(entry) = state.auth_cache.get(ip) {
-        if entry.expiry > Instant::now() { // Если кэш ещё действителен
+        if entry.expiry > Instant::now() {
             if entry.is_valid {
-                return Ok(()); // Пользователь уже проверен, всё ок
+                return Ok(());
             } else {
-                return Err(Response::builder().header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8).body(Body::from("Неавторизован")).unwrap());
+                return Err(Response::builder()
+                    .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+                    .body(Body::from("Неавторизован"))
+                    .unwrap());
             }
         }
     }
 
-    let config = state.config.lock().await; // Блокируем конфигурацию для чтения
-    let auth_header = req.headers().get("Authorization").and_then(|h| h.to_str().ok()); // Получаем заголовок авторизации
+    let config = state.config.lock().await;
+    let auth_header = req.headers().get("Authorization").and_then(|h| h.to_str().ok());
 
-    // Проверяем базовую авторизацию (Basic Auth)
-    let is_basic_auth = auth_header.map(|auth| {
-        auth.starts_with("Basic ") && general_purpose::STANDARD.decode(auth.trim_start_matches("Basic ")).ok()
-            .and_then(|d| String::from_utf8(d).ok())
-            .map(|cred| cred == format!("{}:{}", config.basic_auth_login, config.basic_auth_password))
-            .unwrap_or(false)
-    }).unwrap_or(false);
-
-    // Проверяем JWT токен
+    // Проверяем только JWT токен
     let is_jwt_auth = auth_header.map(|auth| {
-        auth.starts_with("Bearer ") && decode::<HashMap<String, String>>(auth.trim_start_matches("Bearer "), &DecodingKey::from_secret(config.jwt_secret.as_ref()), &Validation::default()).is_ok()
+        auth.starts_with("Bearer ") && 
+        decode::<HashMap<String, String>>(
+            auth.trim_start_matches("Bearer "),
+            &DecodingKey::from_secret(config.jwt_secret.as_ref()),
+            &Validation::default()
+        ).is_ok()
     }).unwrap_or(false);
 
-    // Если ни одна проверка не прошла
-    if !is_basic_auth && !is_jwt_auth {
+    // Если авторизация не прошла
+    if !is_jwt_auth {
         let now = Instant::now();
-        let mut entry = state.auth_attempts.entry(ip.to_string()).or_insert((0, now)); // Записываем попытку авторизации
-        if now.duration_since(entry.1) < Duration::from_secs(60) { // Если в течение минуты
-            entry.0 += 1; // Увеличиваем счётчик попыток
-            if entry.0 >= 5 { // Если слишком много попыток
-                state.blacklist.insert(ip.to_string(), ()); // Добавляем в чёрный список
+        let mut entry = state.auth_attempts.entry(ip.to_string()).or_insert((0, now));
+        if now.duration_since(entry.1) < Duration::from_secs(60) {
+            entry.0 += 1;
+            if entry.0 >= 5 {
+                state.blacklist.insert(ip.to_string(), ());
                 state.auth_attempts.remove(ip);
                 warn!("IP {} добавлен в чёрный список", ip);
-                state.auth_cache.insert(ip.to_string(), AuthCacheEntry { is_valid: false, expiry: Instant::now() + Duration::from_secs(60) });
-                return Err(Response::builder().header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8).body(Body::from("Доступ запрещён")).unwrap());
+                state.auth_cache.insert(ip.to_string(), AuthCacheEntry { 
+                    is_valid: false, 
+                    expiry: Instant::now() + Duration::from_secs(60) 
+                });
+                return Err(Response::builder()
+                    .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+                    .body(Body::from("Доступ запрещён"))
+                    .unwrap());
             }
         } else {
-            *entry = (1, now); // Сбрасываем счётчик
+            *entry = (1, now);
         }
-        state.auth_cache.insert(ip.to_string(), AuthCacheEntry { is_valid: false, expiry: Instant::now() + Duration::from_secs(60) });
-        return Err(Response::builder().header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8).body(Body::from("Неавторизован")).unwrap());
+        state.auth_cache.insert(ip.to_string(), AuthCacheEntry { 
+            is_valid: false, 
+            expiry: Instant::now() + Duration::from_secs(60) 
+        });
+        return Err(Response::builder()
+            .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+            .body(Body::from("Неавторизован"))
+            .unwrap());
     }
-    // Если авторизация прошла, кэшируем результат
-    state.auth_cache.insert(ip.to_string(), AuthCacheEntry { is_valid: true, expiry: Instant::now() + Duration::from_secs(60) });
+    
+    // Если авторизация прошла
+    state.auth_cache.insert(ip.to_string(), AuthCacheEntry { 
+        is_valid: true, 
+        expiry: Instant::now() + Duration::from_secs(60) 
+    });
     Ok(())
 }
 
@@ -246,6 +258,7 @@ async fn handle_http_request(req: Request<Body>, https_port: u16) -> Result<Resp
     Ok(Response::builder().status(StatusCode::MOVED_PERMANENTLY).header(header::LOCATION, redirect_url).body(Body::empty()).unwrap())
 }
 
+// Обрабатываем HTTPS запросы
 // Обрабатываем HTTPS запросы
 async fn handle_https_request(req: Request<Body>, state: Arc<ProxyState>, client_ip: Option<IpAddr>) -> Result<Response<Body>, Infallible> {
     let ip = match get_client_ip(&req, client_ip) { // Получаем IP клиента
