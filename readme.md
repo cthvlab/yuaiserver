@@ -98,7 +98,7 @@ YUAI Server — это не просто сервер, это ваш верны�
 
 Попробуйте отправить запрос:
 ```bash
-curl -H "Authorization: Basic dXNlcjpwYXNzd29yZA==" http://localhost:80
+curl -H "Authorization: Bearer YOUR_JWT_TOKEN" https://localhost
 ```
 
 ---
