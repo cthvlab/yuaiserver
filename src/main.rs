@@ -320,7 +320,7 @@ async fn handle_https_request(req: Request<Body>, state: Arc<ProxyState>, client
 }
 
 // Перезагружаем конфигурацию каждые 60 секунд
-async fn reload_config(state: Arc<ProxyState>) {  // Убираем tx, так как не перезапускаем сервер
+async fn reload_config(state: Arc<ProxyState>) {  
     let mut current_config = state.config.lock().await.clone();
     loop {
         tokio::time::sleep(Duration::from_secs(60)).await; // Ждём минуту
@@ -505,7 +505,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(run_http_server(initial_config.clone(), http_shutdown_rx));
         tokio::spawn(run_https_server(state.clone(), initial_config.clone(), https_shutdown_rx));
         tokio::spawn(run_quic_server(initial_config, quic_shutdown_rx));
-        tokio::spawn(reload_config(state.clone())); // Передаём только state, без tx
+        tokio::spawn(reload_config(state.clone())); 
 
         // Обрабатываем обновления конфигурации (оставляем для совместимости, но теперь не обязательно)
         while let Some(new_config) = config_rx.recv().await {
