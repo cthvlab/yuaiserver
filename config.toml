@@ -10,10 +10,6 @@ cert_path = "cert.pem"
 key_path = "key.pem"
 # Секретный ключ для проверки JWT токенов
 jwt_secret = "your_jwt_secret"
-# Логин для базовой авторизации
-basic_auth_login = "admin"
-# Пароль для базовой авторизации
-basic_auth_password = "password"
 # Количество потоков для обработки задач (зависит от процессора, обычно равно числу ядер)
 worker_threads = 16
 
