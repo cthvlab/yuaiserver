@@ -4,21 +4,24 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-hyper = { version = "0.14", features = ["server", "tcp", "http1", "http2", "stream"] }
-hyper-rustls = "0.27"
-rustls = "0.23"
+hyper = { version = "1.0", features = ["http1", "http2", "server"] }
 tokio = { version = "1.0", features = ["full"] }
-tokio-rustls = "0.26"
-tokio-stream = "0.1"
-tokio-tungstenite = "0.20"
-tungstenite = "0.20"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "1.0"
+hyper-util = { version = "0.1.10", features = ["server", "server-auto"] }
+dashmap = "5.0"
+jsonwebtoken = "8.0"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.5"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-serde = { version = "1.0", features = ["derive"] }
-toml = "0.7"
-jsonwebtoken = "8.3"
-dashmap = "5.5"
-quinn = "0.11.0"
+quinn = "0.11"
+webrtc = "0.9.0"
 futures = "0.3"
-rustls-pemfile = "1.0"
-webrtc = "0.12.0"
+tokio-rustls = "0.26"
+hyper-tungstenite = "0.14"
+http-body-util = "0.1"
+webrtc-dtls = "0.9.0"
+webrtc-ice = "0.10.1"
+webrtc-util = "0.8.1"
+x25519-dalek = "2.0.1"
