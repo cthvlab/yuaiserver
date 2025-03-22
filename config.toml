@@ -11,7 +11,10 @@ key_path = "key.pem"
 # Секретный ключ для проверки JWT токенов
 jwt_secret = "your_jwt_secret"
 # Количество потоков для обработки задач (зависит от процессора, обычно равно числу ядер)
-worker_threads = 16
+worker_threads = 8
+
+# ICE-серверы
+ice_servers = ["stun:stun.l.google.com:19302", "stun:stun.example.com:3478"]
 
 # Секция локаций
 [[locations]]
