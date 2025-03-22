@@ -1,5 +1,8 @@
-use hyper::{Body, Request, Response, Server, header, service::{make_service_fn, service_fn}, StatusCode};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use hyper::{service::service_fn, Request, Response, StatusCode, Error as HttpError};
+use hyper_util::{rt::{TokioExecutor, TokioIo}, server::conn::auto::Builder as AutoBuilder};
+use hyper::header;
+use hyper_tungstenite::{HyperWebsocket, upgrade};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
 use dashmap::DashMap;
 use std::collections::HashMap;
@@ -8,26 +11,26 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::fs::File;
-use std::io::{BufReader as StdBufReader};
+use std::io::BufReader as StdBufReader;
 use tokio::sync::{Mutex as TokioMutex, RwLock};
-use tokio::net::TcpListener;
-use tokio_tungstenite::WebSocketStream;
-use tungstenite::protocol::Role;
+use tokio::net::{TcpListener};
+use tokio_rustls::TlsAcceptor;
+use tokio::task::JoinHandle;
+use tokio::runtime::Builder;
 use tracing::{error, info, warn};
-use tracing_subscriber;
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use serde::Deserialize;
 use quinn::{Endpoint, ServerConfig as QuinnServerConfig, Connection};
-use futures::SinkExt;
+use futures::{StreamExt, SinkExt};
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use webrtc::api::APIBuilder;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::ice_transport::ice_server::RTCIceServer;
-use tokio_rustls::TlsAcceptor;
-use hyper::upgrade::Upgraded;
-use tokio::task::JoinHandle;
-use tokio::io::{self as aio, AsyncBufReadExt, BufReader as AsyncBufReader, AsyncWriteExt};
+use http_body_util::BodyExt;
+use crate::console::run_console;
+
+mod console;
 
 const CONTENT_TYPE_UTF8: &str = "text/plain; charset=utf-8";
 
@@ -47,6 +50,7 @@ struct Config {
     jwt_secret: String,
     worker_threads: usize,
     locations: Vec<Location>,
+    ice_servers: Option<Vec<String>>
 }
 
 #[derive(Clone)]
@@ -98,24 +102,75 @@ fn validate_config(config: &Config) -> Result<(), String> {
         return Err("Недопустимое количество потоков: должно быть от 1 до 1024".to_string());
     }
     load_tls_config(config).map_err(|e| format!("Ошибка TLS конфигурации: {}", e))?;
+
+    // Проверка ice_servers
+    match &config.ice_servers {
+        Some(servers) if servers.is_empty() => {
+            return Err("Список ICE-серверов не может быть пустым".to_string());
+        }
+        None => {
+            warn!("ICE-серверы не указаны в конфигурации, будет использован стандартный STUN-сервер.");
+        }
+        Some(_) => {} // Всё в порядке, ICE-серверы есть и не пустые
+    }
+
     Ok(())
 }
 
+
+
 fn load_tls_config(config: &Config) -> Result<ServerConfig, Box<dyn std::error::Error>> {
-    let certs = certs(&mut StdBufReader::new(File::open(&config.cert_path)?))?.into_iter().map(CertificateDer::from).collect();
-    let key = pkcs8_private_keys(&mut StdBufReader::new(File::open(&config.key_path)?))?.into_iter().next().ok_or("Приватный ключ не найден")?;
-    let mut cfg = ServerConfig::builder().with_no_client_auth().with_single_cert(certs, PrivateKeyDer::Pkcs8(key.into()))?;
+    let cert_file = File::open(&config.cert_path)?;
+    let key_file = File::open(&config.key_path)?;
+
+    // Load certificates
+    let certs: Vec<CertificateDer> = certs(&mut StdBufReader::new(cert_file))?
+        .into_iter()
+        .map(|bytes| CertificateDer::from(bytes))
+        .collect();
+
+    // Load private keys
+    let keys: Vec<PrivateKeyDer> = pkcs8_private_keys(&mut StdBufReader::new(key_file))?
+        .into_iter()
+        .map(|bytes| PrivateKeyDer::from(PrivatePkcs8KeyDer::from(bytes)))
+        .collect();
+    let key = keys.into_iter().next().ok_or("Приватный ключ не найден")?;
+
+    // Configure ServerConfig
+    let mut cfg = ServerConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(cfg)
 }
 
-fn load_quinn_config(config: &Config) -> QuinnServerConfig {
-    let certs = certs(&mut StdBufReader::new(File::open(&config.cert_path).unwrap())).unwrap().into_iter().map(CertificateDer::from).collect();
-    let key = pkcs8_private_keys(&mut StdBufReader::new(File::open(&config.key_path).unwrap())).unwrap().into_iter().next().unwrap();
-    QuinnServerConfig::with_single_cert(certs, PrivateKeyDer::Pkcs8(key.into())).unwrap()
+fn load_quinn_config(config: &Config) -> Result<QuinnServerConfig, Box<dyn std::error::Error>> {
+    let cert_file = File::open(&config.cert_path)?;
+    let key_file = File::open(&config.key_path)?;
+
+    // Load certificates
+    let certs: Vec<CertificateDer> = certs(&mut StdBufReader::new(cert_file))?
+        .into_iter()
+        .map(|bytes| CertificateDer::from(bytes))
+        .collect();
+
+    // Load private keys
+    let keys: Vec<PrivateKeyDer> = pkcs8_private_keys(&mut StdBufReader::new(key_file))?
+        .into_iter()
+        .map(|bytes| PrivateKeyDer::from(PrivatePkcs8KeyDer::from(bytes)))
+        .collect();
+    let key = keys.into_iter().next().ok_or("Приватный ключ не найден")?;
+
+    // Configure QuinnServerConfig
+    QuinnServerConfig::with_single_cert(certs, key)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
-async fn check_auth(req: &Request<Body>, state: &ProxyState, ip: &str) -> Result<(), Response<Body>> {
+
+
+
+async fn check_auth(req: &Request<hyper::body::Incoming>, state: &ProxyState, ip: &str) -> Result<(), Response<String>> {
     if let Some(entry) = state.auth_cache.get(ip) {
         if entry.expiry > Instant::now() {
             if entry.is_valid {
@@ -123,7 +178,7 @@ async fn check_auth(req: &Request<Body>, state: &ProxyState, ip: &str) -> Result
             } else {
                 return Err(Response::builder()
                     .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
-                    .body(Body::from("Неавторизован"))
+                    .body("Неавторизован".to_string())
                     .unwrap());
             }
         }
@@ -156,7 +211,7 @@ async fn check_auth(req: &Request<Body>, state: &ProxyState, ip: &str) -> Result
                 });
                 return Err(Response::builder()
                     .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
-                    .body(Body::from("Доступ запрещён"))
+                    .body("Доступ запрещён".to_string())
                     .unwrap());
             }
         } else {
@@ -168,7 +223,7 @@ async fn check_auth(req: &Request<Body>, state: &ProxyState, ip: &str) -> Result
         });
         return Err(Response::builder()
             .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
-            .body(Body::from("Неавторизован"))
+            .body("Неавторизован".to_string())
             .unwrap());
     }
     
@@ -179,17 +234,19 @@ async fn check_auth(req: &Request<Body>, state: &ProxyState, ip: &str) -> Result
     Ok(())
 }
 
-fn get_client_ip(req: &Request<Body>, client_ip: Option<IpAddr>) -> Option<String> {
+fn get_client_ip(req: &Request<hyper::body::Incoming>, client_ip: Option<IpAddr>) -> Option<String> {
     req.headers().get("X-Forwarded-For").and_then(|v| v.to_str().ok()).and_then(|s| s.split(',').next()).map(|s| s.trim().to_string()).or_else(|| client_ip.map(|ip| ip.to_string()))
 }
 
-async fn handle_websocket(upgraded: Upgraded) {
-    let mut ws = WebSocketStream::from_raw_socket(upgraded, Role::Server, None).await;
-    while let Some(msg) = tokio_stream::StreamExt::next(&mut ws).await {
-        if let Ok(msg) = msg {
-            if msg.is_text() || msg.is_binary() {
+async fn handle_websocket(websocket: HyperWebsocket) {
+    let mut ws = websocket.await.unwrap(); // Преобразуем HyperWebsocket в WebSocketStream
+    while let Some(msg) = ws.next().await {
+        match msg {
+            Ok(msg) if msg.is_text() || msg.is_binary() => {
                 ws.send(msg).await.unwrap_or_else(|e| error!("Ошибка WebSocket: {}", e));
             }
+            Err(e) => error!("Ошибка WebSocket: {}", e),
+            _ => {}
         }
     }
 }
@@ -214,11 +271,17 @@ async fn check_rate_limit(state: &ProxyState, ip: &str, max_requests: u32) -> bo
 
 async fn handle_webrtc_offer(offer_sdp: String, state: Arc<ProxyState>, client_ip: String) -> Result<String, String> {
     let api = APIBuilder::new().build();
+    let config = state.config.lock().await; // Получаем доступ к конфигурации
+    let ice_servers: Vec<RTCIceServer> = config.ice_servers.clone().unwrap_or_else(|| {
+        warn!("ICE-серверы не указаны в конфигурации, используется стандартный STUN-сервер.");
+        vec!["stun:stun.l.google.com:19302".to_string()]
+    }).iter().map(|url| RTCIceServer {
+        urls: vec![url.clone()],
+        ..Default::default()
+    }).collect();
+
     let config = webrtc::peer_connection::configuration::RTCConfiguration {
-        ice_servers: vec![RTCIceServer {
-            urls: vec!["stun:stun.l.google.com:19302".to_string()],
-            ..Default::default()
-        }],
+        ice_servers,
         ..Default::default()
     };
     let peer_connection = Arc::new(api.new_peer_connection(config).await.map_err(|e| e.to_string())?);
@@ -235,19 +298,39 @@ async fn handle_webrtc_offer(offer_sdp: String, state: Arc<ProxyState>, client_i
     Ok(answer.sdp)
 }
 
-async fn handle_http_request(req: Request<Body>, https_port: u16) -> Result<Response<Body>, Infallible> {
-    let redirect_url = format!("https://{}:{}{}", req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("127.0.0.1"), https_port, req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or(""));
-    Ok(Response::builder().status(StatusCode::MOVED_PERMANENTLY).header(header::LOCATION, redirect_url).body(Body::empty()).unwrap())
+
+async fn handle_http_request(req: Request<hyper::body::Incoming>, https_port: u16) -> Result<Response<String>, Infallible> {
+    let redirect_url = format!(
+        "https://{}:{}{}",
+        req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("127.0.0.1"),
+        https_port,
+        req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("")
+    );
+    Ok(Response::builder()
+        .status(StatusCode::MOVED_PERMANENTLY)
+        .header(header::LOCATION, redirect_url)
+        .body(String::new())
+        .unwrap())
 }
 
-async fn handle_https_request(req: Request<Body>, state: Arc<ProxyState>, client_ip: Option<IpAddr>) -> Result<Response<Body>, Infallible> {
+async fn handle_https_request(
+    mut req: Request<hyper::body::Incoming>,
+    state: Arc<ProxyState>,
+    client_ip: Option<IpAddr>,
+) -> Result<Response<String>, HttpError> {
     let ip = match get_client_ip(&req, client_ip) {
         Some(ip) => ip,
-        None => return Ok(Response::builder().header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8).body(Body::from("IP не определён")).unwrap()),
+        None => return Ok(Response::builder()
+            .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+            .body("IP не определён".to_string())
+            .unwrap()),
     };
 
     if state.blacklist.contains_key(&ip) {
-        return Ok(Response::builder().header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8).body(Body::from("Доступ запрещён")).unwrap());
+        return Ok(Response::builder()
+            .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+            .body("Доступ запрещён".to_string())
+            .unwrap());
     }
 
     if let Err(resp) = check_auth(&req, &state, &ip).await {
@@ -258,29 +341,46 @@ async fn handle_https_request(req: Request<Body>, state: Arc<ProxyState>, client
 
     let max_requests = if state.whitelist.contains_key(&ip) { 100 } else { 10 };
     if !check_rate_limit(&state, &ip, max_requests).await {
-        return Ok(Response::builder().header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8).body(Body::from("Превышен лимит запросов")).unwrap());
+        return Ok(Response::builder()
+            .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+            .body("Превышен лимит запросов".to_string())
+            .unwrap());
     }
 
-    if req.headers().get("Upgrade").map(|v| v == "websocket").unwrap_or(false) {
-        if let Ok(upgraded) = hyper::upgrade::on(req).await {
-            tokio::spawn(handle_websocket(upgraded));
-            return Ok(Response::new(Body::empty()));
-        }
-        return Ok(Response::builder().status(500).header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8).body(Body::from("Ошибка WebSocket")).unwrap());
+    if hyper_tungstenite::is_upgrade_request(&req) {
+        let (response, websocket) = match upgrade(&mut req, None) {
+            Ok(result) => result,
+            Err(e) => return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(format!("Ошибка апгрейда WebSocket: {}", e))
+                .unwrap()),
+        };
+        tokio::spawn(handle_websocket(websocket));
+        return Ok(response.map(|_| String::new()));
     }
 
     if req.uri().path() == "/webrtc/offer" {
-        let offer_sdp = String::from_utf8_lossy(&hyper::body::to_bytes(req.into_body()).await.unwrap()).to_string();
+        let body = req.into_body();
+        let collected = body.collect().await.map_err(|e| HttpError::from(e))?;
+        let body_bytes = collected.to_bytes();
+        let offer_sdp = String::from_utf8_lossy(&body_bytes).to_string();
         match handle_webrtc_offer(offer_sdp, state.clone(), ip).await {
-            Ok(answer_sdp) => return Ok(Response::new(Body::from(answer_sdp))),
-            Err(e) => return Ok(Response::builder().status(500).header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8).body(Body::from(format!("Ошибка WebRTC: {}", e))).unwrap()),
+            Ok(answer_sdp) => return Ok(Response::new(answer_sdp)),
+            Err(e) => return Ok(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+                .body(format!("Ошибка WebRTC: {}", e))
+                .unwrap()),
         }
     }
 
     let url = req.uri().to_string();
     if let Some(entry) = state.cache.get(&url) {
         if entry.expiry > Instant::now() {
-            return Ok(Response::builder().header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8).body(Body::from(entry.response_body.clone())).unwrap());
+            return Ok(Response::builder()
+                .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+                .body(String::from_utf8_lossy(&entry.response_body).to_string())
+                .unwrap());
         }
     }
 
@@ -288,11 +388,17 @@ async fn handle_https_request(req: Request<Body>, state: Arc<ProxyState>, client
     let path = req.uri().path();
     let response_body = locations.iter()
         .find(|loc| path.starts_with(&loc.path))
-        .map(|loc| loc.response.as_bytes().to_vec())
-        .unwrap_or_else(|| "404 Not Found".as_bytes().to_vec());
+        .map(|loc| loc.response.clone())
+        .unwrap_or_else(|| "404 Not Found".to_string());
 
-    state.cache.insert(url, CacheEntry { response_body: response_body.clone(), expiry: Instant::now() + Duration::from_secs(60) });
-    Ok(Response::builder().header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8).body(Body::from(response_body)).unwrap())
+    state.cache.insert(url, CacheEntry { 
+        response_body: response_body.as_bytes().to_vec(), 
+        expiry: Instant::now() + Duration::from_secs(60) 
+    });
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+        .body(response_body)
+        .unwrap())
 }
 
 async fn reload_config(state: Arc<ProxyState>) {  
@@ -344,75 +450,65 @@ async fn handle_quic_connection(connection: Connection) {
 
 async fn run_http_server(config: Config, state: Arc<ProxyState>) {
     let addr = SocketAddr::from(([127, 0, 0, 1], config.http_port));
-    match Server::try_bind(&addr) {
-        Ok(builder) => {
-            let service = move |req: Request<Body>| handle_http_request(req, config.https_port);
-            let server = builder.serve(make_service_fn(move |_| {
-                let service = service.clone();
-                async move { Ok::<_, Infallible>(service_fn(service)) }
-            }));
-            info!("HTTP сервер слушает на {}", addr);
-            *state.http_running.write().await = true;
-            if let Err(e) = server.await {
+    let listener = TcpListener::bind(addr).await.unwrap();
+    info!("\x1b[92mHTTP сервер слушает на {} \x1b[0m", addr);
+    *state.http_running.write().await = true;
+
+    loop {
+        let (stream, _) = listener.accept().await.unwrap();
+        let stream = TokioIo::new(stream); // Оборачиваем в TokioIo
+        let https_port = config.https_port;
+        tokio::spawn(async move {
+            if let Err(e) = AutoBuilder::new(TokioExecutor::new())
+                .http1()
+                .serve_connection(stream, service_fn(move |req| handle_http_request(req, https_port)))
+                .await
+            {
                 error!("Ошибка HTTP: {}", e);
-                *state.http_running.write().await = false;
             }
-        }
-        Err(e) => {
-            error!("Не удалось запустить HTTP сервер на порту {}: {}. Измените http_port в config.toml.", config.http_port, e);
-            *state.http_running.write().await = false;
-        }
+        });
     }
 }
 
 async fn run_https_server(state: Arc<ProxyState>, config: Config) {
     let addr = SocketAddr::from(([127, 0, 0, 1], config.https_port));
-    match TcpListener::bind(addr).await {
-        Ok(listener) => {
-            info!("HTTPS сервер слушает на {}", listener.local_addr().unwrap());
-            *state.https_running.write().await = true;
-            let tls_acceptor = TlsAcceptor::from(Arc::new(load_tls_config(&config).unwrap()));
-            loop {
-                if let Ok((stream, client_ip)) = listener.accept().await {
-                    stream.set_nodelay(true).unwrap();
-                    let state = state.clone();
-                    let acceptor = tls_acceptor.clone();
-                    tokio::spawn(async move {
-                        let tls_stream = match acceptor.accept(stream).await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                error!("Ошибка TLS handshake: {}", e);
-                                return;
-                            }
-                        };
-                        let service = move |req: Request<Body>| handle_https_request(req, state.clone(), Some(client_ip.ip()));
-                        if let Err(e) = Server::builder(hyper::server::accept::from_stream(
-                            tokio_stream::once(Ok::<_, std::io::Error>(tls_stream))
-                        ))
-                        .serve(make_service_fn(move |_| {
-                            let service = service.clone();
-                            async move { Ok::<_, Infallible>(service_fn(service)) }
-                        }))
-                        .await
-                        {
-                            error!("Ошибка HTTPS: {}", e);
-                        }
-                    });
+    let listener = TcpListener::bind(addr).await.unwrap();
+    info!("\x1b[92mHTTPS сервер слушает на {} \x1b[0m", listener.local_addr().unwrap());
+    *state.https_running.write().await = true;
+    let tls_acceptor = TlsAcceptor::from(Arc::new(load_tls_config(&config).unwrap()));
+
+    loop {
+        if let Ok((stream, client_ip)) = listener.accept().await {
+            stream.set_nodelay(true).unwrap();
+            let state = state.clone();
+            let acceptor = tls_acceptor.clone();
+            tokio::spawn(async move {
+                let tls_stream = match acceptor.accept(stream).await {
+                    Ok(s) => TokioIo::new(s), // Оборачиваем в TokioIo
+                    Err(e) => {
+                        error!("Ошибка TLS handshake: {}", e);
+                        return;
+                    }
+                };
+                let service = service_fn(move |req| handle_https_request(req, state.clone(), Some(client_ip.ip())));
+                if let Err(e) = AutoBuilder::new(TokioExecutor::new())
+                    .http1()
+                    .http2()
+                    .serve_connection(tls_stream, service)
+                    .await
+                {
+                    error!("Ошибка HTTPS: {}", e);
                 }
-            }
-        }
-        Err(e) => {
-            error!("Не удалось запустить HTTPS сервер на порту {}: {}. Измените https_port в config.toml.", config.https_port, e);
-            *state.https_running.write().await = false;
+            });
         }
     }
 }
 
 async fn run_quic_server(config: Config, state: Arc<ProxyState>) {
     let addr = SocketAddr::from(([127, 0, 0, 1], config.quic_port));
-    match Endpoint::server(load_quinn_config(&config), addr) {
+    match Endpoint::server(load_quinn_config(&config).unwrap(), addr) {
         Ok(endpoint) => {
-            info!("QUIC сервер слушает на {}", endpoint.local_addr().unwrap());
+            info!("\x1b[92mQUIC сервер слушает на {} \x1b[0m", endpoint.local_addr().unwrap());
             *state.quic_running.write().await = true;
             while let Some(conn) = endpoint.accept().await {
                 tokio::spawn(handle_quic_connection(conn.await.unwrap()));
@@ -425,140 +521,63 @@ async fn run_quic_server(config: Config, state: Arc<ProxyState>) {
     }
 }
 
-async fn print_help(stdout: &mut tokio::io::Stdout) {
-    stdout.write_all(
-        "\n=== Список команд ===\n\
-         1 - Показать статус\n\
-         2 - Перезагрузить конфигурацию\n\
-         3 - Добавить локацию\n\
-         4 - Показать активные сессии\n\
-         5 - Выход\n\
-         help - Показать этот список\n".as_bytes()
-    ).await.unwrap();
-    stdout.flush().await.unwrap();
-}
-
-async fn prompt_new_location(stdout: &mut tokio::io::Stdout, reader: &mut AsyncBufReader<tokio::io::Stdin>) -> Option<(String, String)> {
-    let mut path = String::new();
-    let mut response = String::new();
-
-    stdout.write_all("\nВведите путь (например, /test): ".as_bytes()).await.unwrap();
-    stdout.flush().await.unwrap();
-    if reader.read_line(&mut path).await.unwrap_or(0) == 0 {
-        return None;
-    }
-
-    stdout.write_all("Введите ответ: ".as_bytes()).await.unwrap();
-    stdout.flush().await.unwrap();
-    if reader.read_line(&mut response).await.unwrap_or(0) == 0 {
-        return None;
-    }
-
-    let path = path.trim().to_string();
-    let response = response.trim().to_string();
-    if path.is_empty() || response.is_empty() {
-        None
-    } else {
-        Some((path, response))
-    }
-}
-
-async fn run_console(state: Arc<ProxyState>) {
-    let stdin = aio::stdin();
-    let mut reader = AsyncBufReader::new(stdin);
-    let mut stdout = aio::stdout();
-
-    stdout.write_all(
-        format!(
-            "\nСтатус сервера:\nСессий: {}\nРазмер кэша: {}\nПопыток авторизации: {}\n",
-            state.sessions.len(),
-            state.cache.len(),
-            state.auth_attempts.len()
-        ).as_bytes()
-    ).await.unwrap();
-    print_help(&mut stdout).await;
-    stdout.write_all(b"\n> ").await.unwrap();
-    stdout.flush().await.unwrap();
-
-    let mut input = String::new();
-    loop {
-        input.clear();
-
-        if reader.read_line(&mut input).await.unwrap_or(0) == 0 {
-            stdout.write_all("\nЗавершение консоли...\n".as_bytes()).await.unwrap();
-            break;
-        }
-
-        let command = input.trim();
-
-        match command {
-            "1" => {
-                stdout.write_all(
-                    format!(
-                        "\nСтатус сервера:\nСессий: {}\nРазмер кэша: {}\nПопыток авторизации: {}\nHTTP: {}\nHTTPS: {}\nQUIC: {}\n",
-                        state.sessions.len(),
-                        state.cache.len(),
-                        state.auth_attempts.len(),
-                        if *state.http_running.read().await { "работает" } else { "не работает" },
-                        if *state.https_running.read().await { "работает" } else { "не работает" },
-                        if *state.quic_running.read().await { "работает" } else { "не работает" }
-                    ).as_bytes()
-                ).await.unwrap();
-            }
-            "2" => {
-                match load_config().await {
-                    Ok(new_config) if validate_config(&new_config).is_ok() => {
-                        *state.config.lock().await = new_config.clone();
-                        *state.locations.write().await = new_config.locations.clone();
-                        stdout.write_all("\nКонфигурация перезагружена\n".as_bytes()).await.unwrap();
-                    }
-                    _ => {
-                        stdout.write_all("\nОшибка валидации конфигурации\n".as_bytes()).await.unwrap();
-                    }
-                }
-            }
-            "3" => {
-                if let Some((path, response)) = prompt_new_location(&mut stdout, &mut reader).await {
-                    state.locations.write().await.push(Location { path, response });
-                    stdout.write_all("\nЛокация добавлена\n".as_bytes()).await.unwrap();
-                }
-            }
-            "4" => {
-                let sessions: Vec<_> = state.sessions.iter().map(|e| e.key().clone()).collect();
-                stdout.write_all(format!("\nАктивные сессии: {:?}\n", sessions).as_bytes()).await.unwrap();
-            }
-            "5" => {
-                stdout.write_all("\nЗавершение консоли...\n".as_bytes()).await.unwrap();
-                break;
-            }
-            "help" => {
-                print_help(&mut stdout).await;
-            }
-            "" => {}
-            _ => {
-                stdout.write_all("\nНеверная команда, введите 'help' для списка команд\n".as_bytes()).await.unwrap();
-            }
-        }
-
-        stdout.write_all("\nВведите команду: ".as_bytes()).await.unwrap();
-        stdout.flush().await.unwrap();
-    }
-
-    stdout.flush().await.unwrap();
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    rustls::crypto::ring::default_provider().install_default().expect("Ошибка CryptoProvider");
-    tracing_subscriber::fmt::init();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Ошибка CryptoProvider");
 
-    let initial_config = tokio::runtime::Runtime::new().unwrap().block_on(async {
-        load_config().await.and_then(|cfg| validate_config(&cfg).map(|_| cfg)).map_err(|e| {
-            error!("Ошибка начальной конфигурации: {}", e);
-            "Некорректная конфигурация"
-        })
-    })?;
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let initial_config = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(async {
+            match load_config().await {
+                Ok(cfg) => match validate_config(&cfg) {
+                    Ok(()) => Ok(cfg),
+                    Err(e) => {
+                        tracing::error!("Ошибка валидации конфигурации: {}", e);
+                        Err("Некорректная конфигурация")
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        "Ошибка загрузки конфигурации: {}. Используются настройки по умолчанию.",
+                        e
+                    );
+                    let mut default_config = Config {
+                        http_port: 80,
+                        https_port: 443,
+                        quic_port: 444,
+                        cert_path: "cert.pem".to_string(),
+                        key_path: "key.pem".to_string(),
+                        jwt_secret: "your_jwt_secret".to_string(),
+                        worker_threads: 16,
+                        locations: vec![],
+                        ice_servers: Some(vec!["stun:stun.l.google.com:19302".to_string()]),
+                    };
+                    if e.contains("missing field `ice_servers`") {
+                        if let Ok(content) = tokio::fs::read_to_string("config.toml").await {
+                            if let Ok(mut partial_config) = toml::from_str::<Config>(&content) {
+                                partial_config.ice_servers =
+                                    Some(vec!["stun:stun.l.google.com:19302".to_string()]);
+                                default_config = partial_config;
+                            }
+                        }
+                    }
+                    match validate_config(&default_config) {
+                        Ok(()) => Ok(default_config),
+                        Err(e) => {
+                            tracing::error!("Дефолтная конфигурация недействительна: {}", e);
+                            Err("Некорректная конфигурация")
+                        }
+                    }
+                }
+            }
+        })?;
+
+    let runtime = Builder::new_multi_thread()
         .worker_threads(initial_config.worker_threads)
         .enable_all()
         .build()
@@ -593,12 +612,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         *state.https_handle.lock().await = Some(https_handle);
         *state.quic_handle.lock().await = Some(quic_handle);
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let console_handle = tokio::spawn(run_console(state.clone()));
 
-        run_console(state.clone()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         tokio::signal::ctrl_c().await?;
-        info!("Сервер завершил работу");
+        tracing::info!("Получен сигнал Ctrl+C, завершаем работу сервера...");
+
+        tracing::info!("Завершаем все задачи...");
 
         if let Some(handle) = state.http_handle.lock().await.take() {
             handle.abort();
@@ -610,6 +631,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             handle.abort();
         }
         reload_handle.abort();
+        console_handle.abort();
+
+        tracing::info!("Сервер полностью завершён");
 
         Ok::<(), Box<dyn std::error::Error>>(())
     })?;
