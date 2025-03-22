@@ -1,4 +1,3 @@
-// Инструменты для капитанского мостика!
 use std::sync::Arc; // Общий штурвал для юнг
 use tokio::io::{self as aio, AsyncBufReadExt, BufReader as AsyncBufReader, AsyncWriteExt}; // Рация: слушать и кричать
 use tokio::select; // Выбирать, что делать первым, как штурман на развилке
