@@ -1,5 +1,3 @@
-// АРРР! Это наш пиратский ящик с инструментами для космопорта!
-
 use hyper::{service::service_fn, Request, Response, StatusCode, Error as HttpError}; // Двигатель для HTTP: запросы, ответы и ошибки
 use hyper_util::{rt::{TokioExecutor, TokioIo}, server::conn::auto::Builder as AutoBuilder}; // Помощники для двигателя: юнги и провода
 use hyper::header; // Заголовки — как печати на письмах
