@@ -1,157 +1,183 @@
-use std::sync::Arc; // Общий штурвал для юнг
-use tokio::io::{self as aio, AsyncBufReadExt, BufReader as AsyncBufReader, AsyncWriteExt}; // Рация: слушать и кричать
-use tokio::select; // Выбирать, что делать первым, как штурман на развилке
-use crate::{ProxyState, Location, load_config, validate_config}; // Карта, маршруты и штурвал космопорта
+use std::sync::Arc;
+use tokio::io::{self as aio, AsyncBufReadExt, BufReader as AsyncBufReader};
+use tokio::select;
+use crate::{ProxyState, Location, load_config, validate_config};
+use tokio::fs; // Для записи в файл
+use toml; // Для сериализации в TOML
+use tracing::{info, error}; // Рация для капитана: вести журнал событий и кричать о бедах
 
-// Запускаем капитанскую консоль — место, где отдаем приказы!
+// Запускаем капитанскую консоль — место, где отдаём приказы!
 pub async fn run_console(state: Arc<ProxyState>) {
-    let stdin = aio::stdin(); // Ухо для приказов капитана
-    let mut reader = AsyncBufReader::new(stdin); // Юнга, который слушает
-    let mut stdout = aio::stdout(); // Рупор для криков капитана
+    let stdin = aio::stdin();
+    let mut reader = AsyncBufReader::new(stdin);
 
-    // Показываем, как дела в порту
-    stdout
-        .write_all(get_server_status(&state, false).await.as_bytes()) // Пишем статус
-        .await
-        .unwrap();
-    print_help(&mut stdout).await; // Показываем список приказов
-    stdout.write_all(b"\n> ").await.unwrap(); // Говорим: "Давай, капитан!"
-    stdout.flush().await.unwrap(); // Убеждаемся, что все слышали
+    // Сразу показываем список команд через рацию капитана
+    print_help().await;
 
-    let mut input = String::new(); // Сундучок для команд
+    let mut input = String::new();
 
-    loop { // Вечно слушаем капитана
-        select! { // Слушаем, что скажет первым
-            result = reader.read_line(&mut input) => { // Читаем приказ
+    loop {
+        select! {
+            result = reader.read_line(&mut input) => {
                 match result {
-                    Ok(0) => { // Если капитан сказал "хватит" (Ctrl+D/Z)
-                        stdout.write_all("\nЗавершение консоли...\n".as_bytes()).await.unwrap();
-                        break; // Закрываем мостик
+                    Ok(0) => {
+                        info!("Завершение консоли, капитан отдал приказ!");
+                        break;
                     }
-                    Ok(_) => { // Приказ получен!
-                        let command = input.trim(); // Убираем лишнее с команды
+                    Ok(_) => {
+                        let command = input.trim();
                         match command {
-                            "1" => { // "Как дела, юнга?"
-                                stdout.write_all(get_server_status(&state, true).await.as_bytes()).await.unwrap();
+                            "1" => {
+                                let status = get_server_status(&state, true).await;
+                                info!("Капитан запросил статус космопорта: {}", status);
                             }
-                            "2" => { // "Обнови карту!"
-                                match load_config().await { // Берем новую карту
-                                    Ok(new_config) if validate_config(&new_config).is_ok() => { // Карта годная?
-                                        *state.config.lock().await = new_config.clone(); // Меняем старую
-                                        *state.locations.write().await = new_config.locations.clone(); // Обновляем маршруты
-                                        stdout.write_all("\nКонфигурация перезагружена\n".as_bytes()).await.unwrap();
+                            "2" => {
+                                match load_config().await {
+                                    Ok(new_config) if validate_config(&new_config).is_ok() => {
+                                        *state.config.lock().await = new_config.clone();
+                                        *state.locations.write().await = new_config.locations.clone();
+                                        info!("Капитан перезагрузил конфигурацию звездного атласа!");
                                     }
-                                    _ => { // Карта кривая
-                                        stdout.write_all("\nОшибка валидации конфигурации\n".as_bytes()).await.unwrap();
+                                    _ => {
+                                        info!("\x1b[91mОшибка валидации новой карты, капитан!\x1b[0m");
                                     }
                                 }
                             }
-                            "3" => { // "Добавь новый путь!"
-                                if let Some((path, response)) = prompt_new_location(&mut stdout, &mut reader).await {
-                                    state.locations.write().await.push(Location { path, response }); // Добавляем маршрут
-                                    stdout.write_all("\nЛокация добавлена\n".as_bytes()).await.unwrap();
+                            "3" => {
+                                if let Some((path, response)) = prompt_new_location(&mut reader).await {
+                                    let mut locations = state.locations.write().await;
+                                    let mut config = state.config.lock().await;
+                                    locations.push(Location { path: path.clone(), response: response.clone() });
+                                    config.locations.push(Location { path, response });
+                                    // Сохраняем конфигурацию в файл
+                                    match save_config(&config).await {
+                                        Ok(()) => info!("\x1b[32mКапитан добавил новую локацию в звездный атлас!\x1b[0m"),
+                                        Err(e) => info!("\x1b[91mОшибка сохранения звездной карты: {}\x1b[0m", e),
+                                    }
+                                } else {
+                                    info!("Капитан не указал путь или ответ для новой локации, шторм его побери!");
                                 }
                             }
-                            "4" => { // "Кто в порту?"
-                                let sessions: Vec<_> = state.sessions.iter().map(|e| e.key().clone()).collect(); // Список гостей
-                                stdout.write_all(format!("\nАктивные сессии: {:?}\n", sessions).as_bytes()).await.unwrap();
+                            "4" => {
+                                let sessions: Vec<_> = state.sessions.iter().map(|e| e.key().clone()).collect();
+                                info!("Капитан запросил список активных сессий: {:?}", sessions);
                             }
-                            "help" => { // "Что я могу?"
-                                print_help(&mut stdout).await; // Показываем приказы
+                            "help" => {
+                                info!("Капитан запросил список команд!");
+                                print_help().await;
                             }
-                            "" => {} // Пусто? Молчим!
-                            _ => { // Чушь какая-то
-                                stdout.write_all("\nНеверная команда, введите 'help' для списка команд\n".as_bytes()).await.unwrap();
+                            "" => {}
+                            _ => {
+                                info!("Капитан ввел неверную команду: {}. Введи 'help' для списка команд!", command);
                             }
                         }
-                        stdout.write_all("\n> ".as_bytes()).await.unwrap(); // "Еще приказы, капитан?"
-                        stdout.flush().await.unwrap(); // Убеждаемся, что крикнули
+                        // Показываем приглашение для следующего приказа
+                        info!("\n> ");
                     }
-                    Err(e) => { // Рация сломалась
-                        tracing::error!("Ошибка чтения ввода: {}", e);
+                    Err(e) => {
+                        error!("Ошибка чтения ввода капитана: {}", e);
                         break;
                     }
                 }
-                input.clear(); // Чистим сундучок для нового приказа
+                input.clear();
             }
         }
     }
 }
 
-// Показываем, как дела в порту!
-async fn get_server_status(state: &ProxyState, full: bool) -> String {
-    let config = state.config.lock().await; // Берем карту под замок
+// Показываем статус сервера
+pub async fn get_server_status(state: &ProxyState, full: bool) -> String {
+    let config = state.config.lock().await;
     let base_status = format!(
-        "\x1b[95m\nСтатус сервера:\nСессий: {} Размер кэша: {} Попыток авторизации: {}\x1b[0m",
-        state.sessions.len(), // Сколько гостей
-        state.cache.len(), // Сколько добычи в складе
-        state.auth_attempts.len() // Сколько раз ломились
+        "\x1b[35m\nСтатус космопорта!:\nСессий: {} Размер кэша: {} Попыток авторизации: {}\x1b[0m",
+        state.sessions.len(),
+        state.cache.len(),
+        state.auth_attempts.len()
     );
     
-    if full { // Если капитан хочет все подробности
+    if full {
         format!(
-            "{}\nHTTP: {} (порт: {})\nHTTPS: {} (порт: {})\nQUIC: {} (порт: {})",
+            "{}\n\x1b[95mHTTP: {} (порт: {})\nHTTPS: {} (порт: {})\nQUIC: {} (порт: {})\x1b[0m",
             base_status,
-            if *state.http_running.read().await { "работает" } else { "не работает" }, // Шлюпки
+            if *state.http_running.read().await { "работает" } else { "\x1b[90mне работает\x1b[0m" },
             config.http_port,
-            if *state.https_running.read().await { "работает" } else { "не работает" }, // Крейсеры
+            if *state.https_running.read().await { "работает" } else { "\x1b[90mне работает\x1b[0m" },
             config.https_port,
-            if *state.quic_running.read().await { "работает" } else { "не работает" }, // Звездолеты
+            if *state.quic_running.read().await { "работает" } else { "\x1b[90mне работает\x1b[0m" },
             config.quic_port
         )
     } else {
-        base_status // Только основное
+        base_status
     }
 }
 
-// Кричим в рупор список приказов!
-async fn print_help(stdout: &mut tokio::io::Stdout) {
-    stdout
-        .write_all(
-            "\n=== Список команд ===\n\
-             1 - Показать статус\n\
-             2 - Перезагрузить конфигурацию\n\
-             3 - Добавить локацию\n\
-             4 - Показать активные сессии\n\
-             help - Показать этот список\n"
-                .as_bytes(),
-        )
-        .await
-        .unwrap();
-    stdout.flush().await.unwrap(); // Убеждаемся, что все слышали
+// Выводим список команд через рацию капитана
+async fn print_help() {
+    info!(
+        "\x1b[90m\n=== Список команд ===\n\
+         1 - Показать статус\n\
+         2 - Перезагрузить конфигурацию\n\
+         3 - Добавить локацию\n\
+         4 - Показать активные сессии\n\
+         help - Показать этот список\n\x1b[0m"
+    );
 }
 
-// Спрашиваем у капитана новый маршрут!
+// Запрашиваем новую локацию
 async fn prompt_new_location(
-    stdout: &mut tokio::io::Stdout,
     reader: &mut AsyncBufReader<tokio::io::Stdin>,
 ) -> Option<(String, String)> {
-    let mut path = String::new(); // Куда лететь?
-    let mut response = String::new(); // Что дать?
+    let mut path = String::new();
+    let mut response = String::new();
 
-    stdout
-        .write_all("\nВведите путь (например, /test): ".as_bytes()) // "Куда, капитан?"
-        .await
-        .unwrap();
-    stdout.flush().await.unwrap();
-    if reader.read_line(&mut path).await.unwrap_or(0) == 0 { // Если молчит
+    // Запрашиваем путь для новой звезды
+    info!("\nВведите путь (например, /test): ");
+    if reader.read_line(&mut path).await.unwrap_or(0) == 0 {
         return None;
     }
 
-    stdout
-        .write_all("Введите ответ: ".as_bytes()) // "Что отдать, капитан?"
-        .await
-        .unwrap();
-    stdout.flush().await.unwrap();
-    if reader.read_line(&mut response).await.unwrap_or(0) == 0 { // Если опять молчит
+    // Запрашиваем добычу для этого пути
+    info!("Введите ответ: ");
+    if reader.read_line(&mut response).await.unwrap_or(0) == 0 {
         return None;
     }
 
-    let path = path.trim().to_string(); // Чистим путь
-    let response = response.trim().to_string(); // Чистим ответ
-    if path.is_empty() || response.is_empty() { // Пусто? Ничего не делаем
-        None
+    let path = path.trim().to_string();
+    let response = response.trim().to_string();
+    if path.is_empty() || response.is_empty() {
+        None // Если путь или ответ пусты, капитан ошибся!
     } else {
-        Some((path, response)) // Новый маршрут готов!
+        Some((path, response)) // Новая звезда на карте, капитан!
     }
+}
+
+// Сохраняем конфигурацию в файл
+async fn save_config(config: &crate::Config) -> Result<(), String> {
+    // Читаем текущий config.toml, чтобы сохранить существующий порядок
+    let current_content = fs::read_to_string("config.toml")
+        .await
+        .map_err(|e| format!("Не удалось открыть звездную карту: {}", e))?;
+    let mut current_config: toml::Value = toml::from_str(&current_content)
+        .map_err(|e| format!("Ошибка чтения текущей карты: {}", e))?;
+
+    // Обновляем только поле locations
+    let new_locations = config.locations.iter()
+        .map(|loc| {
+            let mut map = toml::value::Table::new();
+            map.insert("path".to_string(), toml::Value::String(loc.path.clone()));
+            map.insert("response".to_string(), toml::Value::String(loc.response.clone()));
+            toml::Value::Table(map)
+        })
+        .collect::<Vec<_>>();
+    current_config.as_table_mut()
+        .ok_or("Звездная карта испорчена, нет таблицы!".to_string())?
+        .insert("locations".to_string(), toml::Value::Array(new_locations));
+
+    // Сериализуем обратно в строку
+    let toml_string = toml::to_string_pretty(&current_config)
+        .map_err(|e| format!("Ошибка сериализации конфигурации: {}", e))?;
+    fs::write("config.toml", toml_string)
+        .await
+        .map_err(|e| format!("Ошибка записи в config.toml: {}", e))?;
+    Ok(())
 }
