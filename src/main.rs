@@ -1,5 +1,5 @@
 use hyper::{service::service_fn, Request, Response, StatusCode, Error as HttpError}; // Двигатель для HTTP: запросы, ответы и ошибки
-use hyper_util::{rt::{TokioExecutor, TokioIo}, server::conn::auto::Builder as AutoBuilder}; // Помощники для двигателя: юнги и провода
+use hyper_util::{rt::{TokioExecutor, TokioIo}, server::conn::auto::Builder as AutoBuilder}; // Помощники для двигателя: капитаны и провода
 use hyper::header; // Заголовки — как печати на письмах
 use hyper_tungstenite::{HyperWebsocket, upgrade}; // Телепорт WebSocket для быстрых прыжков
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer}; // Шифры: пропуска и ключи
@@ -8,18 +8,18 @@ use dashmap::DashMap; // Быстрый сундук для хранения д�
 use std::collections::HashMap; // Обычный сундук для списков
 use std::convert::Infallible; // Ошибка, которой не бывает — как честный пират!
 use std::net::{IpAddr, SocketAddr}; // Координаты: адрес и порт
-use std::sync::Arc; // Общий штурвал для юнг
+use std::sync::Arc; // Общий штурвал для капитанов
 use std::time::{Duration, Instant}; // Часы: сколько ждать и когда началось
 use std::fs::File; // Файлы — как карты в сундуке
-use std::io::BufReader as StdBufReader; // Юнга, читающий карты
+use std::io::BufReader as StdBufReader; // Капитан, читающий карты
 use tokio::sync::{Mutex as TokioMutex, RwLock}; // Замки: один пишет, все читают
 use tokio::net::{TcpListener}; // Ухо капитана для TCP-сигналов
 use tokio_rustls::TlsAcceptor; // Приемник шифров для TLS
-use tokio::task::JoinHandle; // Задачи для юнг в фоне
+use tokio::task::JoinHandle; // Задачи для капитанов в фоне
 use tokio::runtime::Builder; // Строитель корабля для команды
 use tracing::{error, info, warn}; // Рация: кричать о бедах и победах
 use jsonwebtoken::{decode, DecodingKey, Validation}; // Проверка пропусков JWT
-use serde::Deserialize; // Чтение карт из текста
+use serde::{Deserialize, Serialize}; // Чтение карт из текста
 use quinn::{Endpoint, ServerConfig as QuinnServerConfig, Connection}; // QUIC: причал и связь для звездолетов
 use futures::{StreamExt, SinkExt}; // Потоки: принимать и отправлять посылки
 use rustls_pemfile::{certs, pkcs8_private_keys}; // Достаем шифры из файлов
@@ -31,28 +31,33 @@ use http_body_util::BodyExt; // Собираем добычу из запрос�
 use crate::console::run_console; // Консоль капитана для приказов
 
 mod console; // Отдельный отсек для консоли
+mod setup;   // Модуль для подготовки космопорта к запуску
 
 const CONTENT_TYPE_UTF8: &str = "text/plain; charset=utf-8"; // Метка для текстовых посылок
 
-// АРРР! Это как табличка на звездной карте: куда лететь и что отдавать пришельцам!
-#[derive(Deserialize, Clone, PartialEq, Debug)]
+// Это как табличка на звездной карте: куда лететь и что отдавать пришельцам!
+#[derive(Deserialize, Serialize, Clone, PartialEq, Debug)]
 struct Location {
     path: String,     // Путь — это как "поворот налево у третьей звезды"
     response: String, // Ответ — это сокровище, что мы даем гостям
 }
 
-// Это наш главный звездный атлас, где все настройки космопорта!
-#[derive(Deserialize, Clone, PartialEq)]
+// Это наш главный план, где все настройки космопорта!
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 struct Config {
-    http_port: u16,        // Порт для старых шлюпок (HTTP), как номер причала
-    https_port: u16,       // Порт для бронированных крейсеров (HTTPS)
-    quic_port: u16,        // Порт для гиперскоростных звездолетов (QUIC)
-    cert_path: String,     // Где лежит сундук с сертификатами (как пароль для входа)
-    key_path: String,      // Где лежит ключ от сундука
-    jwt_secret: String,    // Тайный пиратский код для проверки пропусков
-    worker_threads: usize, // Сколько энергодвигателей задействуем для ускорения
-    locations: Vec<Location>, // Список всех маршрутов для пришельцев
-    ice_servers: Option<Vec<String>>, // Маяки для телепортации (WebRTC), как звездные фонари
+    http_port: u16,              // Порт для старых шлюпок (HTTP), как номер причала
+    https_port: u16,             // Порт для бронированных крейсеров (HTTPS)
+    quic_port: u16,              // Порт для гиперскоростных звездолетов (QUIC)
+    cert_path: String,           // Где лежит сундук с сертификатами (как пароль для входа)
+    key_path: String,            // Где лежит ключ от сундука
+    jwt_secret: String,          // Тайный пиратский код для проверки пропусков
+    worker_threads: usize,       // Сколько капитанов бегает по палубе
+    locations: Vec<Location>,    // Список всех маршрутов для пришельцев
+    ice_servers: Option<Vec<String>>, // Маяки для телепортации, как звездные фонари
+    guest_rate_limit: u32,       // Лимит для шатающихся гостей, не в списке
+    whitelist_rate_limit: u32,   // Лимит для друзей капитана из белого списка
+    blacklist_rate_limit: u32,   // Лимит для шпионов из черного списка, чтоб не шныряли!
+    rate_limit_window: u64,      // Сколько секунд ждать, пока трюм снова откроется
 }
 
 // Это как сундук с добычей, которую мы уже нашли и храним!
@@ -72,12 +77,13 @@ struct AuthCacheEntry {
 // Главный штурвал космопорта! Тут все, что нужно для управления!
 struct ProxyState {
     cache: DashMap<String, CacheEntry>,          // Склад с добычей (кэш)
-    auth_cache: DashMap<String, AuthCacheEntry>, // Журнал пропусков
+    auth_cache: DashMap<String, AuthCacheEntry>, // Журнал пропусков (пока спит, но пригодится для секретных миссий!)
     whitelist: DashMap<String, ()>,              // Список друзей капитана
     blacklist: DashMap<String, ()>,              // Список врагов и шпионов
     sessions: DashMap<String, Instant>,          // Кто сейчас в порту (сессии)
     auth_attempts: DashMap<String, (u32, Instant)>, // Сколько раз ломились без пропуска
     rate_limits: DashMap<String, (Instant, u32)>, // Лимит запросов, чтобы трюм не лопнул
+    privileged_clients: DashMap<String, Instant>, // Список гостей с золотыми пропусками для особых дел!
     config: TokioMutex<Config>,                  // Звездный атлас под замком
     webrtc_peers: DashMap<String, Arc<RTCPeerConnection>>, // Телепортационные связи с гостями
     locations: Arc<RwLock<Vec<Location>>>,       // Карта маршрутов, где что искать
@@ -89,7 +95,7 @@ struct ProxyState {
     quic_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>, // Рычаг для QUIC
 }
 
-// АРРР! Читаем карту сокровищ (config.toml), чтобы знать, куда лететь!
+// Читаем карту сокровищ (config.toml), чтобы знать, куда лететь!
 async fn load_config() -> Result<Config, String> {
     // Пробуем открыть сундук с картой
     let content = tokio::fs::read_to_string("config.toml").await
@@ -101,33 +107,40 @@ async fn load_config() -> Result<Config, String> {
 
 // Проверяем, не кривая ли наша карта, чтобы не врезаться в астероид!
 fn validate_config(config: &Config) -> Result<(), String> {
-    // Если порты одинаковые, это как два корабля на одном причале — катастрофа!
+    // Если порты дерутся, это как два капитана на одном корабле!
     if config.http_port == config.https_port || config.http_port == config.quic_port || config.https_port == config.quic_port {
         return Err(format!("Порты дерутся, капитан! HTTP={}, HTTPS={}, QUIC={}", config.http_port, config.https_port, config.quic_port));
     }
-    // Проверяем, есть ли сундуки с сертификатами и ключами на месте
+    // Сундук с шифрами на месте?
     if !std::path::Path::new(&config.cert_path).exists() || !std::path::Path::new(&config.key_path).exists() {
-        return Err("Сундук с шифрами потерян, арр!".to_string());
+        return Err("Сундук с шифрами потерян!".to_string());
     }
-    // Юнги нужны, но не целая армия!
+    // Капитаны есть, но не толпа ли?
     if config.worker_threads == 0 || config.worker_threads > 1024 {
-        return Err("Юнг должно быть от 1 до 1024, иначе бардак!".to_string());
+        return Err("Капитанов должно быть от 1 до 1024, иначе бардак на палубе!".to_string());
     }
-    // Проверяем шифры, чтобы нас не подслушали космические шпионы
-    load_tls_config(config).map_err(|e| format!("Шифры сломаны: {}", e))?;
+    load_tls_config(config).map_err(|e| format!("Шифры сломаны, шторм и гром: {}", e))?;
 
-    // Смотрим, есть ли маяки для телепортации
+    // Лимиты скорости — чтоб трюм не лопнул!
+    if config.guest_rate_limit == 0 || config.whitelist_rate_limit == 0 || config.blacklist_rate_limit == 0 {
+        return Err("Лимиты скорости не могут быть 0, капитан! Как жить без добычи?".to_string());
+    }
+    if config.rate_limit_window == 0 {
+        return Err("Окно лимита 0 секунд? Это как ром без бочки, капитан!".to_string());
+    }
+
+    // Маяки для телепортации на месте?
     match &config.ice_servers {
         Some(servers) if servers.is_empty() => {
-            return Err("Маяки пусты, как бутылка рома после пира!".to_string());
+            return Err("Маяки пусты, как трюм после шторма!".to_string());
         }
         None => {
-            warn!("Маяков нет, берем старый маяк STUN!");
+            warn!("Маяков нет, берем старый маяк STUN, йо-хо-хо!");
         }
-        Some(_) => {} // Все готово, юнга!
+        Some(_) => {}
     }
 
-    Ok(())
+    Ok(()) // Карта готова, капитан!
 }
 
 // Грузим шифры для бронированных крейсеров (TLS), чтобы летать безопасно!
@@ -178,26 +191,21 @@ fn load_quinn_config(config: &Config) -> Result<QuinnServerConfig, Box<dyn std::
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
-// Проверяем, настоящий ли пропуск у пришельца!
-async fn check_auth(req: &Request<hyper::body::Incoming>, state: &ProxyState, ip: &str) -> Result<(), Response<String>> {
-    // Смотрим, есть ли пропуск в журнале
-    if let Some(entry) = state.auth_cache.get(ip) {
-        if entry.expiry > Instant::now() { // Пропуск еще свежий?
-            if entry.is_valid {
-                return Ok(()); // Добро пожаловать, гость!
-            } else {
-                return Err(Response::builder()
-                    .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
-                    .body("Фальшивый пропуск, шельма!".to_string())
-                    .unwrap());
-            }
+// Проверяем, есть ли у пришельца золотой пропуск для особых дел!
+async fn check_auth(req: &Request<hyper::body::Incoming>, state: &ProxyState, ip: &str) -> bool {
+    // Смотрим, есть ли уже запись в журнале привилегий
+    if let Some(entry) = state.privileged_clients.get(ip) {
+        if *entry > Instant::now() {
+            info!("Гость {} уже с золотым пропуском, добро пожаловать в каюту капитана!", ip);
+            return true; // Золотой пропуск свежий, как ром из бочки!
         }
     }
 
-    let config = state.config.lock().await; // Берем звездный атлас под замок
-    let auth_header = req.headers().get("Authorization").and_then(|h| h.to_str().ok()); // Ищем пропуск в запросе
+    // Берем звездный атлас под замок
+    let config = state.config.lock().await;
+    let auth_header = req.headers().get("Authorization").and_then(|h| h.to_str().ok());
 
-    // Проверяем, настоящий ли это JWT-пропуск (секретный код)
+    // Проверяем, есть ли у гостя JWT — тайный код для привилегий
     let is_jwt_auth = auth_header.map(|auth| {
         auth.starts_with("Bearer ") && // Пропуск должен начинаться с "Bearer "
         decode::<HashMap<String, String>>(
@@ -207,43 +215,22 @@ async fn check_auth(req: &Request<hyper::body::Incoming>, state: &ProxyState, ip
         ).is_ok()
     }).unwrap_or(false);
 
-    if !is_jwt_auth { // Если пропуска нет или он фальшивый...
-        let now = Instant::now();
-        let mut entry = state.auth_attempts.entry(ip.to_string()).or_insert((0, now)); // Записываем попытку
-        if now.duration_since(entry.1) < Duration::from_secs(60) { // Если ломились недавно...
-            entry.0 += 1; // Добавляем еще одну попытку
-            if entry.0 >= 5 { // 5 раз — и ты шпион!
-                state.blacklist.insert(ip.to_string(), ()); // В черный список!
-                state.auth_attempts.remove(ip); // Убираем из журнала попыток
-                warn!("IP {} — шпион, в черный список!", ip);
-                state.auth_cache.insert(ip.to_string(), AuthCacheEntry { 
-                    is_valid: false, 
-                    expiry: Instant::now() + Duration::from_secs(60) // Запрет на час
-                });
-                return Err(Response::builder()
-                    .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
-                    .body("Ты в черном списке, убирайся!".to_string())
-                    .unwrap());
-            }
-        } else {
-            *entry = (1, now); // Начинаем считать заново
-        }
-        state.auth_cache.insert(ip.to_string(), AuthCacheEntry { 
-            is_valid: false, 
-            expiry: Instant::now() + Duration::from_secs(60) // Записываем, что пропуск фальшивый
-        });
-        return Err(Response::builder()
-            .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
-            .body("Покажи настоящий пропуск, юнга!".to_string())
-            .unwrap());
-    }
-    
-    // Пропуск настоящий, записываем в журнал!
-    state.auth_cache.insert(ip.to_string(), AuthCacheEntry { 
-        is_valid: true, 
-        expiry: Instant::now() + Duration::from_secs(60) // Пропуск действует час
+    // Записываем в журнал авторизации для будущих секретных миссий!
+    state.auth_cache.insert(ip.to_string(), AuthCacheEntry {
+        is_valid: is_jwt_auth, // Пропуск настоящий или фальшивый?
+        expiry: Instant::now() + Duration::from_secs(3600), // Свежий на час, как ром в трюме!
     });
-    Ok(())
+
+    if is_jwt_auth {
+        // Золотой пропуск в кармане, записываем в журнал привилегий!
+        state.privileged_clients.insert(ip.to_string(), Instant::now() + Duration::from_secs(3600)); // Действует час, как звезда на небе!
+        info!("Гость {} получил золотой пропуск, йо-хо-хо! Теперь он в команде!", ip);
+        true // Добро пожаловать в элиту, капитан!
+    } else {
+        // Нет пропуска? Ну и ладно, гуляй как простой гость!
+        info!("Гость {} без золотого пропуска, но пусть заходит, трюм открыт для всех!", ip);
+        false
+    }
 }
 
 // Узнаем, откуда прилетел гость (IP-адрес)!
@@ -271,18 +258,28 @@ async fn manage_session(state: &ProxyState, ip: &str) {
     state.sessions.insert(ip.to_string(), Instant::now()); // Пишем: "Гость прилетел вот сейчас!"
 }
 
-// Проверяем, не слишком ли много запросов от одного гостя!
-async fn check_rate_limit(state: &ProxyState, ip: &str, max_requests: u32) -> bool {
-    let now = Instant::now(); // Текущее время
-    let mut entry = state.rate_limits.entry(ip.to_string()).or_insert((now, 0)); // Берем запись о госте
-    if now.duration_since(entry.0) > Duration::from_secs(60) { // Прошла минута?
-        *entry = (now, 1); // Начинаем считать заново, один запрос
-        true // Можно лететь!
-    } else if entry.1 < max_requests { // Еще есть место в трюме?
-        entry.1 += 1; // Добавляем запрос
-        true // Лети дальше!
+// Проверяем, не слишком ли много добычи тащит этот гость, друг или шпион!
+async fn check_rate_limit(state: &ProxyState, ip: &str) -> bool {
+    let config = state.config.lock().await; // Хватаем звездный атлас под замок
+    let now = Instant::now(); // Сколько сейчас на часах капитана?
+    let mut entry = state.rate_limits.entry(ip.to_string()).or_insert((now, 0)); // Смотрим в трюм гостя
+    let window = Duration::from_secs(config.rate_limit_window); // Сколько ждать, пока ром снова нальют
+    let max_requests = if state.blacklist.contains_key(ip) {
+        config.blacklist_rate_limit // Шпионы получают меньше всех, чтоб не наглели!
+    } else if state.whitelist.contains_key(ip) {
+        config.whitelist_rate_limit // Друзья капитана могут тащить больше добычи!
     } else {
-        false // Трюм полон, жди!
+        config.guest_rate_limit // Обычным гостям — по чуть-чуть, не разгуляешься!
+    };
+
+    if now.duration_since(entry.0) > window { // Прошло время, трюм снова открыт?
+        *entry = (now, 1); // Новый рейд, начинаем считать заново!
+        true // Лети, капитан, добыча твоя!
+    } else if entry.1 < max_requests { // Еще есть место в трюме?
+        entry.1 += 1; // Бросай еще один сундук!
+        true // Тащи дальше, капитан доволен!
+    } else {
+        false // Трюм полон, жди, пока ром не выпьют!
     }
 }
 
@@ -316,20 +313,31 @@ async fn handle_webrtc_offer(offer_sdp: String, state: Arc<ProxyState>, client_i
     Ok(answer.sdp) // Отправляем ответный сигнал
 }
 
-// Старые шлюпки (HTTP) отправляем к бронированным крейсерам (HTTPS)!
+// Старые шлюпки (HTTP) отправляем к бронированным крейсерам (HTTPS) с правильным курсом!
 async fn handle_http_request(req: Request<hyper::body::Incoming>, https_port: u16) -> Result<Response<String>, Infallible> {
-    // Создаем новый курс на HTTPS
+    // Берем имя корабля из запроса, но убираем старый порт, чтоб не запутаться в звездах!
+    let host = req.headers()
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("127.0.0.1");
+    let host_without_port = host.split(':').next().unwrap_or("127.0.0.1"); // Вырезаем порт, как лишний груз с палубы!
+
+    // Прокладываем новый курс на HTTPS — чистый, без космического мусора!
     let redirect_url = format!(
         "https://{}:{}{}",
-        req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("127.0.0.1"), // Имя корабля
-        https_port, // Новый порт
-        req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("") // Путь, куда лететь
+        host_without_port, // Только имя корабля, никаких старых портов!
+        https_port,        // Новый порт — наша цель в гиперпространстве!
+        req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("") // Путь, куда лететь, как звезда на карте!
     );
-    Ok(Response::builder()
-        .status(StatusCode::MOVED_PERMANENTLY) // "Лети туда, юнга!"
-        .header(header::LOCATION, redirect_url) // Новый курс
-        .body(String::new())
-        .unwrap())
+
+    // Отправляем шлюпку в безопасные воды с приказом "Лети туда, капитан!"
+    let response = Response::builder()
+        .status(StatusCode::MOVED_PERMANENTLY) // "Полный вперед на новый курс!"
+        .header(header::LOCATION, &redirect_url) // Карта с новым маршрутом
+        .body(String::new()) // Без лишнего груза в трюме!
+        .unwrap();
+
+    Ok(response)
 }
 
 // Главная палуба для бронированных крейсеров (HTTPS)!
@@ -338,71 +346,74 @@ async fn handle_https_request(
     state: Arc<ProxyState>,
     client_ip: Option<IpAddr>,
 ) -> Result<Response<String>, HttpError> {
-    // Узнаем, откуда гость
+    // Кто этот гость, откуда приплыл?
     let ip = match get_client_ip(&req, client_ip) {
         Some(ip) => ip,
         None => return Ok(Response::builder()
             .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
-            .body("Гость без координат, кто ты?".to_string())
+            .body("Гость без координат, кто ты, шельма?".to_string())
             .unwrap()),
     };
 
-    // Если гость в черном списке...
-    if state.blacklist.contains_key(&ip) {
+    // Шпион в черном списке? Пусть заходит, но с лимитами!
+    if state.blacklist.contains_key(&ip) && !check_rate_limit(&state, &ip).await {
         return Ok(Response::builder()
             .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
-            .body("Ты шпион, вон из порта!".to_string())
+            .body("Ты шпион, и трюм полон! Пушки на тебя, жди своей очереди!".to_string())
             .unwrap());
     }
 
-    // Проверяем пропуск
-    if let Err(resp) = check_auth(&req, &state, &ip).await {
-        return Ok(resp); // Пропуск не прошел, до свидания!
-    }
+    // Проверяем, есть ли золотой пропуск для особых дел
+    let is_privileged = check_auth(&req, &state, &ip).await;
+    manage_session(&state, &ip).await; // Отмечаем в журнале: "Этот гость здесь!"
 
-    manage_session(&state, &ip).await; // Отмечаем гостя в журнале
-
-    // Сколько запросов можно? Друзьям больше!
-    let max_requests = if state.whitelist.contains_key(&ip) { 100 } else { 10 };
-    if !check_rate_limit(&state, &ip, max_requests).await {
+    // Трюм не лопнул от запросов?
+    if !check_rate_limit(&state, &ip).await {
         return Ok(Response::builder()
             .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
-            .body("Слишком много запросов, трюм полон!".to_string())
+            .body("Слишком много добычи, трюм трещит! Жди, капитан!".to_string())
             .unwrap());
     }
 
-    // Телепортация через WebSocket?
+    // Заглядываем в журнал авторизации, вдруг там что интересное!
+    if let Some(auth_entry) = state.auth_cache.get(&ip) {
+        if auth_entry.is_valid && auth_entry.expiry > Instant::now() {
+            info!("Журнал подтверждает: гость {} — проверенный капитан!", ip);
+        }
+    }
+
+    // Телепортация через WebSocket? Йо-хо-хо, прыгай!
     if hyper_tungstenite::is_upgrade_request(&req) {
         let (response, websocket) = match upgrade(&mut req, None) {
             Ok(result) => result,
             Err(e) => return Ok(Response::builder()
                 .status(StatusCode::BAD_REQUEST)
-                .body(format!("Телепорт сломался: {}", e))
+                .body(format!("Телепорт сломался, шторм и гром: {}", e))
                 .unwrap()),
         };
-        tokio::spawn(handle_websocket(websocket)); // Запускаем телепорт
+        tokio::spawn(handle_websocket(websocket)); // Прыжок в гиперпространство!
         return Ok(response.map(|_| String::new()));
     }
 
-    // Телепортация через WebRTC?
+    // Телепортация через WebRTC? Магия звезд зовет!
     if req.uri().path() == "/webrtc/offer" {
-        let body = req.into_body(); // Берем сигнал от гостя
+        let body = req.into_body(); // Хватаем сигнал от гостя
         let collected = body.collect().await.map_err(|e| HttpError::from(e))?;
         let body_bytes = collected.to_bytes();
         let offer_sdp = String::from_utf8_lossy(&body_bytes).to_string();
         match handle_webrtc_offer(offer_sdp, state.clone(), ip).await {
-            Ok(answer_sdp) => return Ok(Response::new(answer_sdp)), // Отправляем ответ
+            Ok(answer_sdp) => return Ok(Response::new(answer_sdp)), // "Лови ответ, капитан!"
             Err(e) => return Ok(Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
-                .body(format!("Телепорт сломан: {}", e))
+                .body(format!("Телепорт барахлит, шторм его побери: {}", e))
                 .unwrap()),
         }
     }
 
-    let url = req.uri().to_string(); // Куда летит гость?
-    if let Some(entry) = state.cache.get(&url) { // Есть ли добыча в складе?
-        if entry.expiry > Instant::now() { // Добыча еще свежая?
+    let url = req.uri().to_string(); // Куда гость плывет?
+    if let Some(entry) = state.cache.get(&url) { // Есть добыча в сундуке?
+        if entry.expiry > Instant::now() { // Ром еще свежий?
             return Ok(Response::builder()
                 .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
                 .body(String::from_utf8_lossy(&entry.response_body).to_string())
@@ -410,17 +421,22 @@ async fn handle_https_request(
         }
     }
 
-    let locations = state.locations.read().await; // Открываем карту маршрутов
-    let path = req.uri().path(); // Куда гость хочет?
-    let response_body = locations.iter()
-        .find(|loc| path.starts_with(&loc.path)) // Ищем нужный путь
-        .map(|loc| loc.response.clone()) // Берем сокровище
-        .unwrap_or_else(|| "404 — звезда не найдена!".to_string()); // Или "нет такого!"
+    let locations = state.locations.read().await; // Открываем космический атлас
+    let path = req.uri().path(); // Куда курс, капитан?
+    let mut response_body = locations.iter()
+        .find(|loc| path.starts_with(&loc.path)) // Ищем сокровище по карте
+        .map(|loc| loc.response.clone()) // Вот твоя добыча!
+        .unwrap_or_else(|| "404 — звезда не найдена, шторм тебя побери!".to_string()); // Или пусто!
 
-    // Кладем добычу в склад
+    // Если гость с золотым пропуском, даем ему привет от капитана (пример будущей функции)
+    if is_privileged {
+        response_body = format!("Привет от капитана, привилегированный гость! {}\n(Скоро тут будет админка, йо-хо-хо!)", response_body);
+    }
+
+    // Бросаем добычу в сундук
     state.cache.insert(url, CacheEntry { 
         response_body: response_body.as_bytes().to_vec(), 
-        expiry: Instant::now() + Duration::from_secs(60) // Добыча свежая час
+        expiry: Instant::now() + Duration::from_secs(60) // Свежо на час, как ром из бочки!
     });
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
@@ -432,10 +448,10 @@ async fn handle_https_request(
 async fn reload_config(state: Arc<ProxyState>) {  
     let mut current_config = state.config.lock().await.clone(); // Берем текущую карту
     loop {
-        tokio::time::sleep(Duration::from_secs(60)).await; // Ждем минуту
+        tokio::time::sleep(Duration::from_secs(60)).await; // Ждем минуту, как штиль перед бурей!
         if let Ok(new_config) = load_config().await { // Пробуем новую карту
             if current_config != new_config && validate_config(&new_config).is_ok() { // Новая и годная?
-                info!("Новая карта, юнга! HTTP={}, HTTPS={}, QUIC={}", 
+                info!("\x1b[32mНовая карта, капитан! HTTP={}, HTTPS={}, QUIC={}\x1b[0m", 
                       new_config.http_port, new_config.https_port, new_config.quic_port);
                 *state.config.lock().await = new_config.clone(); // Меняем карту
                 *state.locations.write().await = new_config.locations.clone(); // Обновляем маршруты
@@ -473,212 +489,225 @@ async fn handle_quic_connection(connection: Connection) {
                 }
             });
         } else {
-            break; // Связь пропала
+            break; // Связь пропала, как корабль в тумане!
         }
     }
 }
 
-// Запускаем порт для старых шлюпок (HTTP)!
+// Запускаем порт для старых шлюпок (HTTP)
 async fn run_http_server(config: Config, state: Arc<ProxyState>) {
-    let addr = SocketAddr::from(([127, 0, 0, 1], config.http_port)); // Причал для шлюпок
-    let listener = TcpListener::bind(addr).await.unwrap(); // Открываем причал
-    info!("\x1b[92mHTTP порт открыт на {} \x1b[0m", addr);
-    *state.http_running.write().await = true; // Отмечаем, что порт работает
-
-    loop {
-        let (stream, _) = listener.accept().await.unwrap(); // Ждем шлюпку
-        let stream = TokioIo::new(stream); // Готовим шлюпку к работе
-        let https_port = config.https_port; // Порт для перенаправления
-        tokio::spawn(async move {
-            if let Err(e) = AutoBuilder::new(TokioExecutor::new())
-                .http1() // Только старый протокол
-                .serve_connection(stream, service_fn(move |req| handle_http_request(req, https_port))) // Перенаправляем
-                .await
-            {
-                error!("Шлюпка утонула: {}", e);
-            }
-        });
-    }
-}
-
-// Запускаем порт для бронированных крейсеров (HTTPS)!
-async fn run_https_server(state: Arc<ProxyState>, config: Config) {
-    let addr = SocketAddr::from(([127, 0, 0, 1], config.https_port)); // Причал для крейсеров
-    let listener = TcpListener::bind(addr).await.unwrap(); // Открываем причал
-    info!("\x1b[92mHTTPS порт открыт на {} \x1b[0m", listener.local_addr().unwrap());
-    *state.https_running.write().await = true; // Отмечаем, что порт работает
-    let tls_acceptor = TlsAcceptor::from(Arc::new(load_tls_config(&config).unwrap())); // Готовим шифры
-
-    loop {
-        if let Ok((stream, client_ip)) = listener.accept().await { // Ждем крейсер
-            stream.set_nodelay(true).unwrap(); // Ускоряем связь
-            let state = state.clone();
-            let acceptor = tls_acceptor.clone();
-            tokio::spawn(async move {
-                let tls_stream = match acceptor.accept(stream).await { // Шифруем связь
-                    Ok(s) => TokioIo::new(s),
-                    Err(e) => {
-                        error!("Шифры подвели: {}", e);
-                        return;
+    let addr = SocketAddr::from(([127, 0, 0, 1], config.http_port));
+    match TcpListener::bind(addr).await {
+        Ok(listener) => {
+            info!("\x1b[92mHTTP порт открыт на {} \x1b[0m", addr);
+            *state.http_running.write().await = true;
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let stream = TokioIo::new(stream);
+                        let https_port = config.https_port;
+                        tokio::spawn(async move {
+                            if let Err(e) = AutoBuilder::new(TokioExecutor::new())
+                                .http1()
+                                .serve_connection(stream, service_fn(move |req| handle_http_request(req, https_port)))
+                                .await
+                            {
+                                error!("Ошибка обработки HTTP-соединения: {}", e);
+                            }
+                        });
                     }
-                };
-                let service = service_fn(move |req| handle_https_request(req, state.clone(), Some(client_ip.ip())));
-                if let Err(e) = AutoBuilder::new(TokioExecutor::new())
-                    .http1() // Старый протокол
-                    .http2() // Новый протокол
-                    .serve_connection(tls_stream, service) // Обрабатываем запросы
-                    .await
-                {
-                    error!("Крейсер подбит: {}", e);
+                    Err(e) => error!("Ошибка принятия HTTP-соединения: {}", e),
                 }
-            });
+            }
         }
+        Err(e) => error!("Не удалось открыть HTTP-порт на {}: {}", addr, e),
     }
 }
 
-// Запускаем порт для гиперскоростных звездолетов (QUIC)!
+// Запускаем причал для бронированных крейсеров (HTTPS)
+async fn run_https_server(state: Arc<ProxyState>, config: Config) {
+    let addr = SocketAddr::from(([127, 0, 0, 1], config.https_port));
+    match TcpListener::bind(addr).await {
+        Ok(listener) => {
+            info!("\x1b[92mHTTPS порт открыт на {} \x1b[0m", listener.local_addr().unwrap());
+            *state.https_running.write().await = true;
+            let tls_acceptor = TlsAcceptor::from(Arc::new(load_tls_config(&config).unwrap()));
+            loop {
+                if let Ok((stream, client_ip)) = listener.accept().await {
+                    stream.set_nodelay(true).unwrap();
+                    let state = state.clone();
+                    let acceptor = tls_acceptor.clone();
+                    tokio::spawn(async move {
+                        match acceptor.accept(stream).await {
+                            Ok(tls_stream) => {
+                                let tls_stream = TokioIo::new(tls_stream);
+                                let service = service_fn(move |req| handle_https_request(req, state.clone(), Some(client_ip.ip())));
+                                if let Err(e) = AutoBuilder::new(TokioExecutor::new())
+                                    .http1()
+                                    .http2()
+                                    .serve_connection(tls_stream, service)
+                                    .await
+                                {
+                                    error!("Ошибка обработки HTTPS-соединения: {}", e);
+                                }
+                            }
+                            Err(e) => error!("Ошибка принятия TLS: {}", e),
+                        }
+                    });
+                }
+            }
+        }
+        Err(e) => error!("Не удалось открыть HTTPS-порт на {}: {}", addr, e),
+    }
+}
+
+// Запускаем причал для гиперскоростных звездолётов (QUIC)
 async fn run_quic_server(config: Config, state: Arc<ProxyState>) {
-    let addr = SocketAddr::from(([127, 0, 0, 1], config.quic_port)); // Причал для QUIC
-    match Endpoint::server(load_quinn_config(&config).unwrap(), addr) { // Открываем причал
+    let addr = SocketAddr::from(([127, 0, 0, 1], config.quic_port));
+    match Endpoint::server(load_quinn_config(&config).unwrap(), addr) {
         Ok(endpoint) => {
             info!("\x1b[92mQUIC порт открыт на {} \x1b[0m", endpoint.local_addr().unwrap());
-            *state.quic_running.write().await = true; // Отмечаем, что порт работает
-            while let Some(conn) = endpoint.accept().await { // Ждем звездолет
-                tokio::spawn(handle_quic_connection(conn.await.unwrap())); // Обрабатываем
+            *state.quic_running.write().await = true;
+            while let Some(conn) = endpoint.accept().await {
+                tokio::spawn(handle_quic_connection(conn.await.unwrap()));
             }
         }
-        Err(e) => {
-            error!("QUIC порт не открылся, меняй карту: {}", e);
-            *state.quic_running.write().await = false;
-        }
+        Err(e) => error!("Не удалось открыть QUIC-порт на {}: {}", addr, e),
     }
 }
 
-// Главная палуба космопорта! Здесь все начинается!
+// Главная палуба космопорта! Здесь всё начинается!
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // АРРР! Устанавливаем шифры, чтобы нас не подслушали космические шпионы!
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("Шифры сломаны, юнга!");
+    // Устанавливаем криптопровайдер для TLS
+    match rustls::crypto::ring::default_provider().install_default() {
+        Ok(()) => info!("Шифры на борту, капитан доволен, йо-хо-хо!"),
+        Err(e) => {
+            warn!("Внимание! Шифры сломаны: {:?}", e);
+            info!("Летим дальше, но безопасность не гарантируется!");
+        }
+    }
 
-    // Включаем рацию, чтобы кричать о проблемах и победах!
+    // Настраиваем рацию для криков о победах и бедах
     tracing_subscriber::fmt()
-        .with_writer(std::io::stderr) // Кричим в космос
+        .with_writer(std::io::stderr)
+        .without_time() // Убираем звездное время, чтоб не путаться в часах!
+        .with_target(false) // Без названий отсеков, только чистые вести!
+        .with_level(false) // Уровень шума не нужен, кричим как есть!
         .init();
 
-    // Создаем машину времени (runtime), чтобы все работало быстро
+    info!("\x1b[32mЗапускаем космопорт, проверяем системы...\x1b[0m");
+
+    // Загружаем начальную карту сокровищ
     let initial_config = tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(async {
-            // Пробуем взять карту из сундука
-            match load_config().await {
-                Ok(cfg) => match validate_config(&cfg) { // Проверяем карту
-                    Ok(()) => Ok(cfg), // Карта годная!
-                    Err(e) => {
-                        tracing::error!("Карта кривая: {}", e);
-                        Err("Карта не годится")
-                    }
-                },
-                Err(e) => { // Карта пропала? Берем запасную!
-                    tracing::warn!("Карта потеряна: {}. Берем старую!", e);
-                    let mut default_config = Config {
-                        http_port: 80, // Причал для шлюпок
-                        https_port: 443, // Причал для крейсеров
-                        quic_port: 444, // Причал для звездолетов
-                        cert_path: "cert.pem".to_string(), // Сундук с шифрами
-                        key_path: "key.pem".to_string(), // Ключ от сундука
-                        jwt_secret: "your_jwt_secret".to_string(), // Тайный код
-                        worker_threads: 16, // 16 юнг на палубе
-                        locations: vec![], // Пока маршрутов нет
-                        ice_servers: Some(vec!["stun:stun.l.google.com:19302".to_string()]), // Запасной маяк
-                    };
-                    if e.contains("missing field `ice_servers`") { // Если маяков нет в старой карте...
-                        if let Ok(content) = tokio::fs::read_to_string("config.toml").await {
-                            if let Ok(mut partial_config) = toml::from_str::<Config>(&content) {
-                                partial_config.ice_servers = Some(vec!["stun:stun.l.google.com:19302".to_string()]);
-                                default_config = partial_config; // Чиним карту
-                            }
-                        }
-                    }
-                    match validate_config(&default_config) {
-                        Ok(()) => Ok(default_config), // Запасная карта годится!
-                        Err(e) => {
-                            tracing::error!("Запасная карта кривая: {}", e);
-                            Err("Карта не годится")
-                        }
-                    }
+            match setup::setup_config().await {
+                Ok(config) => Ok(config),
+                Err(e) => {
+                    error!("Ошибка загрузки конфигурации: {}", e);
+                    Err("Запуск отменён, шторм нас побери!")
                 }
             }
         })?;
 
-    // Создаем корабль с юнгами, чтобы все работало одновременно!
+    info!("\x1b[32mКонфигурация загружена, готовим корабль к взлету...\x1b[0m");
+
+    // Строим многопалубный звездолет с командой капитанов
     let runtime = Builder::new_multi_thread()
-        .worker_threads(initial_config.worker_threads) // Сколько юнг бегает
-        .enable_all() // Включаем все пушки
+        .worker_threads(initial_config.worker_threads)
+        .enable_all()
         .build()
         .unwrap();
 
-    // Запускаем корабль в полет!
+    // Взлетаем в гиперпространство!
     runtime.block_on(async {
-        // Собираем штурвал космопорта
+        // Собираем штурвал и сундуки для управления космопортом
         let state = Arc::new(ProxyState {
-            cache: DashMap::new(), // Пустой склад для добычи
-            auth_cache: DashMap::new(), // Пустой журнал пропусков
-            whitelist: DashMap::new(), // Список друзей пуст
-            blacklist: DashMap::new(), // Список врагов пуст
-            sessions: DashMap::new(), // Журнал гостей пуст
-            auth_attempts: DashMap::new(), // Журнал попыток пуст
-            rate_limits: DashMap::new(), // Лимиты пусты
-            config: TokioMutex::new(initial_config.clone()), // Карта под замком
-            webrtc_peers: DashMap::new(), // Телепортационных связей пока нет
-            locations: Arc::new(RwLock::new(initial_config.locations.clone())), // Маршруты с карты
-            http_running: Arc::new(RwLock::new(false)), // HTTP еще не работает
-            https_running: Arc::new(RwLock::new(false)), // HTTPS спит
-            quic_running: Arc::new(RwLock::new(false)), // QUIC отдыхает
-            http_handle: Arc::new(TokioMutex::new(None)), // Рычаг для HTTP пуст
-            https_handle: Arc::new(TokioMutex::new(None)), // Рычаг для HTTPS пуст
-            quic_handle: Arc::new(TokioMutex::new(None)), // Рычаг для QUIC пуст
+            cache: DashMap::new(),
+            auth_cache: DashMap::new(),
+            whitelist: DashMap::new(),
+            blacklist: DashMap::new(),
+            sessions: DashMap::new(),
+            auth_attempts: DashMap::new(),
+            rate_limits: DashMap::new(),
+            privileged_clients: DashMap::new(),
+            config: TokioMutex::new(initial_config.clone()),
+            webrtc_peers: DashMap::new(),
+            locations: Arc::new(RwLock::new(initial_config.locations.clone())),
+            http_running: Arc::new(RwLock::new(false)),
+            https_running: Arc::new(RwLock::new(false)),
+            quic_running: Arc::new(RwLock::new(false)),
+            http_handle: Arc::new(TokioMutex::new(None)),
+            https_handle: Arc::new(TokioMutex::new(None)),
+            quic_handle: Arc::new(TokioMutex::new(None)),
         });
 
-        // Запускаем все порты и помощников!
-        let http_handle = tokio::spawn(run_http_server(initial_config.clone(), state.clone())); // Шлюпки
-        let https_handle = tokio::spawn(run_https_server(state.clone(), initial_config.clone())); // Крейсеры
-        let quic_handle = tokio::spawn(run_quic_server(initial_config.clone(), state.clone())); // Звездолеты
-        let reload_handle = tokio::spawn(reload_config(state.clone())); // Обновление карты
+        // Запускаем шлюпки HTTP в космос
+        let http_handle = tokio::spawn({
+            let state = state.clone();
+            let config = initial_config.clone();
+            async move {
+                run_http_server(config, state).await;
+            }
+        });
 
-        // Ставим рычаги на место
+        // Отправляем бронированные крейсеры HTTPS на орбиту
+        let https_handle = tokio::spawn({
+            let state = state.clone();
+            let config = initial_config.clone();
+            async move {
+                run_https_server(state, config).await;
+            }
+        });
+
+        // Выпускаем гиперскоростные звездолеты QUIC в галактику
+        let quic_handle = tokio::spawn({
+            let state = state.clone();
+            let config = initial_config.clone();
+            async move {
+                run_quic_server(config, state).await;
+            }
+        });
+
+        // Задаем капитану обновлять карту каждые 60 секунд
+        let reload_handle = tokio::spawn(reload_config(state.clone()));
+
+        // Закрепляем рычаги управления
         *state.http_handle.lock().await = Some(http_handle);
         *state.https_handle.lock().await = Some(https_handle);
         *state.quic_handle.lock().await = Some(quic_handle);
 
-        // Запускаем капитанскую консоль
+        // Ждем, пока все паруса поднимутся и двигатели загудят!
+        while !(*state.http_running.read().await && *state.https_running.read().await && *state.quic_running.read().await) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        info!("\x1b[32mКосмопорт запущен, все системы в порядке! Полный вперед, йо-хо-хо!\x1b[0m");
+        // Показываем карту и статус на мостике
+        let initial_status = console::get_server_status(&state, true).await;
+        info!("{}", initial_status);
+
+        // Врубаем консоль для приказов с капитанского мостика
         let console_handle = tokio::spawn(run_console(state.clone()));
 
-        // Ждем чуть-чуть, чтобы все заработало
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Ждем сигнала "Шторм!" (Ctrl+C) от капитана
+        // Ждем сигнала с мостика (Ctrl+C) для посадки
         tokio::signal::ctrl_c().await?;
-        tracing::info!("Шторм зовет, юнга! Завершаем рейд...");
-
-        // Сворачиваем паруса, закрываем порты!
-        tracing::info!("Сворачиваем паруса...");
-        if let Some(handle) = state.http_handle.lock().await.take() { // Выключаем HTTP
+        info!("\x1b[32mПора уходить в гиперпространство, закрываем шлюзы и гасим огни\x1b[0m");
+        if let Some(handle) = state.http_handle.lock().await.take() {
             handle.abort();
         }
-        if let Some(handle) = state.https_handle.lock().await.take() { // Выключаем HTTPS
+        if let Some(handle) = state.https_handle.lock().await.take() {
             handle.abort();
         }
-        if let Some(handle) = state.quic_handle.lock().await.take() { // Выключаем QUIC
+        if let Some(handle) = state.quic_handle.lock().await.take() {
             handle.abort();
         }
-        reload_handle.abort(); // Перестаем обновлять карту
-        console_handle.abort(); // Выключаем консоль
+        reload_handle.abort();
+        console_handle.abort();
 
-        tracing::info!("Космопорт закрыт, до новых приключений, юнга!");
+        info!("\x1b[32mКосмопорт ушел в другую галактику, до новых приключений, капитан!\x1b[0m");
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })?;   
 
-        Ok::<(), Box<dyn std::error::Error>>(()) // Все готово, капитан!
-    })?;
-
-    Ok(()) // Корабль успешно завершил рейд!
+    Ok(())
 }
