@@ -5,6 +5,7 @@ use crate::{ProxyState, Location, load_config, validate_config};
 use tokio::fs; // Для записи в файл
 use toml; // Для сериализации в TOML
 use tracing::{info, error}; // Рация для капитана: вести журнал событий и кричать о бедах
+use colored::Colorize; // Красота в консоли
 
 // Запускаем капитанскую консоль — место, где отдаём приказы!
 pub async fn run_console(state: Arc<ProxyState>) {
@@ -21,7 +22,7 @@ pub async fn run_console(state: Arc<ProxyState>) {
             result = reader.read_line(&mut input) => {
                 match result {
                     Ok(0) => {
-                        info!("Завершение консоли, капитан отдал приказ!");
+                        info!(target: "console", "Завершение консоли, капитан отдал приказ!");
                         break;
                     }
                     Ok(_) => {
@@ -29,17 +30,17 @@ pub async fn run_console(state: Arc<ProxyState>) {
                         match command {
                             "1" => {
                                 let status = get_server_status(&state, true).await;
-                                info!("Капитан запросил статус космопорта: {}", status);
+                                info!(target: "console", "Капитан запросил статус космопорта: {}", status);
                             }
                             "2" => {
                                 match load_config().await {
                                     Ok(new_config) if validate_config(&new_config).is_ok() => {
                                         *state.config.lock().await = new_config.clone();
                                         *state.locations.write().await = new_config.locations.clone();
-                                        info!("Капитан перезагрузил конфигурацию звездного атласа!");
+                                        info!(target: "console", "Капитан перезагрузил конфигурацию звездного атласа!");
                                     }
                                     _ => {
-                                        info!("\x1b[91mОшибка валидации новой карты, капитан!\x1b[0m");
+                                        info!(target: "console", "\x1b[91mОшибка валидации новой карты, капитан!\x1b[0m");
                                     }
                                 }
                             }
@@ -47,35 +48,35 @@ pub async fn run_console(state: Arc<ProxyState>) {
                                 if let Some((path, response)) = prompt_new_location(&mut reader).await {
                                     let mut locations = state.locations.write().await;
                                     let mut config = state.config.lock().await;
-                                    locations.push(Location { path: path.clone(), response: response.clone() });
-                                    config.locations.push(Location { path, response });
+                                    locations.push(Location { path: path.clone(), response: response.clone(), headers: None, });
+                                    config.locations.push(Location { path, response, headers: None, });
                                     // Сохраняем конфигурацию в файл
                                     match save_config(&config).await {
-                                        Ok(()) => info!("\x1b[32mКапитан добавил новую локацию в звездный атлас!\x1b[0m"),
-                                        Err(e) => info!("\x1b[91mОшибка сохранения звездной карты: {}\x1b[0m", e),
+                                        Ok(()) => info!(target: "console", "\x1b[32mКапитан добавил новую локацию в звездный атлас!\x1b[0m"),
+                                        Err(e) => info!(target: "console", "\x1b[91mОшибка сохранения звездной карты: {}\x1b[0m", e),
                                     }
                                 } else {
-                                    info!("Капитан не указал путь или ответ для новой локации, шторм его побери!");
+                                    info!(target: "console", "Капитан не указал путь или ответ для новой локации, шторм его побери!");
                                 }
                             }
                             "4" => {
                                 let sessions: Vec<_> = state.sessions.iter().map(|e| e.key().clone()).collect();
-                                info!("Капитан запросил список активных сессий: {:?}", sessions);
+                                info!(target: "console", "Капитан запросил список активных сессий: {:?}", sessions);
                             }
                             "help" => {
-                                info!("Капитан запросил список команд!");
+                                info!(target: "console", "Капитан запросил список команд!");
                                 print_help().await;
                             }
                             "" => {}
                             _ => {
-                                info!("Капитан ввел неверную команду: {}. Введи 'help' для списка команд!", command);
+                                info!(target: "console", "Капитан ввел неверную команду: {}. Введи 'help' для списка команд!", command);
                             }
                         }
                         // Показываем приглашение для следующего приказа
-                        info!("\n> ");
+                        info!(target: "console", "\n> ");
                     }
                     Err(e) => {
-                        error!("Ошибка чтения ввода капитана: {}", e);
+                        error!(target: "console", "Ошибка чтения ввода капитана: {}", e);
                         break;
                     }
                 }
@@ -97,7 +98,7 @@ pub async fn get_server_status(state: &ProxyState, full: bool) -> String {
     
     if full {
         format!(
-            "{}\n\x1b[95mHTTP: {} (порт: {})\nHTTPS: {} (порт: {})\nQUIC: {} (порт: {})\x1b[0m",
+            "{}\n\x1b[35mHTTP: {} (порт: {})\nHTTPS: {} (порт: {})\nQUIC: {} (порт: {})\x1b[0m",
             base_status,
             if *state.http_running.read().await { "работает" } else { "\x1b[90mне работает\x1b[0m" },
             config.http_port,
@@ -113,13 +114,14 @@ pub async fn get_server_status(state: &ProxyState, full: bool) -> String {
 
 // Выводим список команд через рацию капитана
 async fn print_help() {
-    info!(
-        "\x1b[90m\n=== Список команд ===\n\
-         1 - Показать статус\n\
-         2 - Перезагрузить конфигурацию\n\
-         3 - Добавить локацию\n\
-         4 - Показать активные сессии\n\
-         help - Показать этот список\n\x1b[0m"
+    println!(
+        "{}",
+        "\n=== Карта команд, капитан! ===\n\
+         1 - Взглянуть на статус космопорта\n\
+         2 - Перегрузить звездную карту\n\
+         3 - Нанести новую звезду на карту\n\
+         4 - Кто шныряет по палубе?\n\
+         help - Выдать эту шпаргалку, йо-хо-хо!".green()
     );
 }
 
@@ -131,13 +133,13 @@ async fn prompt_new_location(
     let mut response = String::new();
 
     // Запрашиваем путь для новой звезды
-    info!("\nВведите путь (например, /test): ");
+    info!(target: "console", "\nВведите путь (например, /test): ");
     if reader.read_line(&mut path).await.unwrap_or(0) == 0 {
         return None;
     }
 
     // Запрашиваем добычу для этого пути
-    info!("Введите ответ: ");
+    info!(target: "console", "Введите ответ: ");
     if reader.read_line(&mut response).await.unwrap_or(0) == 0 {
         return None;
     }
