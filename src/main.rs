@@ -126,7 +126,7 @@ fn build_response(
     let mut builder = Response::builder()
         .status(status) // Флаг состояния — "Всё в порядке" или "Шторм на горизонте"!
         .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8) // Ром в бочке, текст по умолчанию!
-        .header(header::SERVER, "YUAI Cosmoport") // Флаг нашего корабля, гордо реет!
+        .header(header::SERVER, "YUAI CosmoPort") // Флаг нашего корабля, гордо реет!
         .header(header::CACHE_CONTROL, "no-cache") // Не храним добычу, если не сказано иное!
         .header(header::CONTENT_LENGTH, body.len().to_string()) // Сколько золота в трюме!
         .header("X-Content-Type-Options", "nosniff") // Не нюхай наш ром, шпион!
@@ -173,12 +173,13 @@ fn build_h3_response(
     }
 
     match builder.body(()) {
-        Ok(resp) => Ok(resp), // Шапка готова, добыча полетит следом!
-        Err(e) => {
-            error!("Не удалось собрать шапку для HTTP/3: {}", e);
-            Err(format!("Ошибка на сервере, шторм в эфире: {}", e))
-        }
-    }
+		Ok(resp) => Ok(resp), // Шапка готова, добыча полетит следом!
+		Err(e) => {
+			let err = format!("Не удалось собрать шапку для HTTP/3: {}", e);
+			error!("{}", err);
+			Err(err)
+		}
+	}
 }
 
 // Читаем карту сокровищ, чтоб знать, куда лететь!
@@ -186,15 +187,17 @@ async fn load_config() -> Result<Config, String> {
     let content = match tokio::fs::read_to_string("config.toml").await {
         Ok(content) => content,
         Err(e) => {
-            error!("Карта пропала в шторме: {}", e);
-            return Err(format!("Карта пропала в шторме: {}", e));
+            let err = format!("Карта пропала в шторме: {}", e);
+            error!("{}", err);
+            return Err(err);
         }
     };
     match toml::from_str(&content) {
         Ok(config) => Ok(config),
         Err(e) => {
-            error!("Шторм и гром, карта порвана: {}", e);
-            Err(format!("Шторм и гром, карта порвана: {}", e))
+            let err = format!("Шторм и гром, карта порвана: {}", e);
+            error!("{}", err);
+            Err(err)
         }
     }
 }
@@ -202,39 +205,54 @@ async fn load_config() -> Result<Config, String> {
 // Проверяем карту, чтоб не врезаться в астероид!
 fn validate_config(config: &Config) -> Result<(), String> {
     info!("Проверяем карту, капитан! Все ли звезды на месте?");
+    
     if config.http_port == config.https_port || config.http_port == config.quic_port || config.https_port == config.quic_port {
         let err = format!("Порты дерутся, как пираты за ром! HTTP={}, HTTPS={}, QUIC={}", config.http_port, config.https_port, config.quic_port);
         error!("{}", err);
         return Err(err);
     }
+    
     if !std::path::Path::new(&config.cert_path).exists() || !std::path::Path::new(&config.key_path).exists() {
-        error!("Сундук с шифрами потерян в черной дыре!");
-        return Err("Сундук с шифрами потерян в черной дыре!".to_string());
+        let err = "Сундук с шифрами потерян в черной дыре!".to_string();
+        error!("{}", err);
+        return Err(err);
     }
+    
     if config.worker_threads == 0 || config.worker_threads > 1024 {
-        error!("Капитанов должно быть от 1 до 1024, иначе бардак на палубе!");
-        return Err("Капитанов должно быть от 1 до 1024, иначе бардак на палубе!".to_string());
+        let err = "Капитанов должно быть от 1 до 1024, иначе бардак на палубе!".to_string();
+        error!("{}", err);
+        return Err(err);
     }
+    
     if let Err(e) = load_tls_config(config) {
-        error!("Шифры сломаны, шторм их побери: {}", e);
-        return Err(format!("Шифры сломаны, шторм их побери: {}", e));
+        let err = format!("Шифры сломаны, шторм их побери: {}", e);
+        error!("{}", err);
+        return Err(err);
     }
+    
     if config.guest_rate_limit == 0 || config.whitelist_rate_limit == 0 || config.blacklist_rate_limit == 0 {
-        error!("Лимиты скорости не могут быть 0, капитан! Как жить без добычи?");
-        return Err("Лимиты скорости не могут быть 0, капитан! Как жить без добычи?".to_string());
+        let err = "Лимиты скорости не могут быть 0, капитан! Как жить без добычи?".to_string();
+        error!("{}", err);
+        return Err(err);
     }
+    
     if config.rate_limit_window == 0 {
-        error!("Окно лимита 0 секунд? Это как ром без бочки!");
-        return Err("Окно лимита 0 секунд? Это как ром без бочки!".to_string());
+        let err = "Окно лимита 0 секунд? Это как ром без бочки!".to_string();
+        error!("{}", err);
+        return Err(err);
     }
+    
     if config.max_request_body_size == 0 || config.max_request_body_size > 1024 * 1024 * 100 {
-        error!("Лимит трюма должен быть от 1 байта до 100 МБ, иначе корабль потонет!");
-        return Err("Лимит трюма должен быть от 1 байта до 100 МБ, иначе корабль потонет!".to_string());
+        let err = "Лимит трюма должен быть от 1 байта до 100 МБ, иначе корабль потонет!".to_string();
+        error!("{}", err);
+        return Err(err);
     }
+    
     match &config.ice_servers {
         Some(servers) if servers.is_empty() => {
-            error!("Маяки пусты, как трюм после шторма!");
-            Err("Маяки пусты, как трюм после шторма!".to_string())
+            let err = "Маяки пусты, как трюм после шторма!".to_string();
+            error!("{}", err);
+            Err(err)
         }
         None => {
             warn!("Маяков нет, берем старый STUN, йо-хо-хо!");
@@ -268,9 +286,10 @@ fn load_tls_config(config: &Config) -> Result<ServerConfig, Box<dyn std::error::
         .map(|bytes| PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(bytes)))
         .collect();
     let key = keys.into_iter().next().ok_or_else(|| {
-        error!("Ключ пропал, как ром перед боем!");
-        "Ключ пропал, как ром перед боем!"
-    })?;
+		let err = "Ключ пропал, как ром перед боем!".to_string();
+		error!("{}", err);
+		err
+	})?;
     let mut cfg = ServerConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?
         .with_no_client_auth()
@@ -304,9 +323,10 @@ fn load_quinn_config(config: &Config) -> Result<QuinnServerConfig, Box<dyn std::
         .map(|bytes| PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(bytes)))
         .collect();
     let key = keys.into_iter().next().ok_or_else(|| {
-        error!("Ключ улетел в черную дыру!");
-        "Ключ улетел в черную дыру!"
-    })?;
+		let err = "Ключ улетел в черную дыру!".to_string();
+		error!("{}", err);
+		err
+	})?;
     let mut quinn_config = QuinnServerConfig::with_single_cert(certs, key)?;
     let mut transport_config = quinn::TransportConfig::default();
     transport_config.max_concurrent_bidi_streams(100u32.into());
@@ -432,16 +452,19 @@ async fn handle_websocket(websocket: HyperWebsocket, state: Arc<ProxyState>, ip:
 async fn handle_webrtc_offer(offer_sdp: String, state: Arc<ProxyState>, client_ip: String) -> Result<String, String> {
     info!("Гость {} вызывает телепорт WebRTC, зажигаем звёзды!", client_ip);
     if std::net::IpAddr::from_str(&client_ip).is_err() {
+        let err = "Фальшивый IP, шторм тебя побери!".to_string();
         warn!("Гость {} с фальшивой картой IP, телепорт закрыт!", client_ip);
-        return Err("Фальшивый IP, шторм тебя побери!".to_string());
+        return Err(err);
     }
     if !check_rate_limit(&state, &client_ip).await {
+        let err = "Трюм трещит, жди своей очереди, шельмец!".to_string();
         warn!("Гость {} слишком шустрый, звёзды гаснут!", client_ip);
-        return Err("Трюм трещит, жди своей очереди, шельмец!".to_string());
+        return Err(err);
     }
     if offer_sdp.len() > 10 * 1024 {
+        let err = "Слишком большой сигнал, звёзды не выдержат!".to_string();
         warn!("Гость {} тащит сигнал больше 10 КБ через WebRTC!", client_ip);
-        return Err("Слишком большой сигнал, звёзды не выдержат!".to_string());
+        return Err(err);
     }
     let api = APIBuilder::new().build();
     let config = state.config.lock().await;
@@ -459,38 +482,44 @@ async fn handle_webrtc_offer(offer_sdp: String, state: Arc<ProxyState>, client_i
     let peer_connection = match api.new_peer_connection(peer_config).await {
         Ok(pc) => Arc::new(pc),
         Err(e) => {
-            error!("Ошибка создания WebRTC моста для {}: {}", client_ip, e);
-            return Err(format!("Ошибка на сервере, шторм в эфире: {}", e));
+            let err = format!("Ошибка создания WebRTC моста для {}: {}", client_ip, e);
+            error!("{}", err);
+            return Err(err);
         }
     };
     let data_channel = match peer_connection.create_data_channel("proxy", None).await {
         Ok(dc) => dc,
         Err(e) => {
-            error!("Ошибка трубы в трюм для {}: {}", client_ip, e);
-            return Err(format!("Ошибка на сервере, шторм в эфире: {}", e));
+            let err = format!("Ошибка трубы в трюм для {}: {}", client_ip, e);
+            error!("{}", err);
+            return Err(err);
         }
     };
     let offer = match RTCSessionDescription::offer(offer_sdp) {
         Ok(offer) => offer,
         Err(e) => {
-            error!("Сигнал кривой для {}: {}", client_ip, e);
-            return Err(format!("Сигнал кривой: {}", e));
+            let err = format!("Сигнал кривой для {}: {}", client_ip, e);
+            error!("{}", err);
+            return Err(err);
         }
     };
     if let Err(e) = peer_connection.set_remote_description(offer).await {
-        error!("Ошибка метки на карте для {}: {}", client_ip, e);
-        return Err(format!("Ошибка на сервере, шторм в эфире: {}", e));
+        let err = format!("Ошибка метки на карте для {}: {}", client_ip, e);
+        error!("{}", err);
+        return Err(err);
     }
     let answer = match peer_connection.create_answer(None).await {
         Ok(answer) => answer,
         Err(e) => {
-            error!("Ошибка маяка в ответ для {}: {}", client_ip, e);
-            return Err(format!("Ошибка на сервере, шторм в эфире: {}", e));
+            let err = format!("Ошибка маяка в ответ для {}: {}", client_ip, e);
+            error!("{}", err);
+            return Err(err);
         }
     };
     if let Err(e) = peer_connection.set_local_description(answer.clone()).await {
-        error!("Ошибка флага на мачте для {}: {}", client_ip, e);
-        return Err(format!("Ошибка на сервере, шторм в эфире: {}", e));
+        let err = format!("Ошибка флага на мачте для {}: {}", client_ip, e);
+        error!("{}", err);
+        return Err(err);
     }
     state.webrtc_peers.insert(client_ip.clone(), peer_connection.clone());
     data_channel.on_message(Box::new(move |msg| {
@@ -549,7 +578,7 @@ async fn handle_http_request(
     match Response::builder()
         .status(StatusCode::MOVED_PERMANENTLY)
         .header(header::LOCATION, redirect_url)
-        .header(header::SERVER, "CosmoPort/1.0")
+        .header(header::SERVER, "YUAI CosmoPort")
         .body(Full::new(Bytes::new()))
     {
         Ok(resp) => Ok(resp),
@@ -1157,6 +1186,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         info!(target: "console","\x1b[32mКосмопорт запущен, полный вперёд, йо-хо-хо!\x1b[0m");
+		
         // Показываем карту и статус на мостике!
         let initial_status = console::get_server_status(&state, true).await;
         info!(target: "console", "{}", initial_status);
