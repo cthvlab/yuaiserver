@@ -3,41 +3,54 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use crate::Config; // Импортируем структуру Config из main
+use colored::Colorize;
 
 // Дефолтный config.toml как строка
 const DEFAULT_CONFIG_TOML: &str = r#"
-# Порт для старых шлюпок (HTTP), как номер причала
-http_port = 8888
-# Порт для бронированных крейсеров (HTTPS) 
-https_port = 8443
-# Порт для гиперскоростных звездолетов (QUIC)
-quic_port = 8444
+worker_threads = 16 # Сколько юнг бегает по палубе
+trusted_host = "localhost"
+
+http_port = 8888 		# Порт для старых шлюпок (HTTP)
+https_port = 8443 		# Порт для бронированных крейсеров (HTTPS)
+quic_port = 8444 		# Порт для гиперскоростных звездолетов (QUIC)
+
 # Где лежит сундук с шифрами
 cert_path = "cert.pem"
-# Где лежит ключ от сундука
+# Где лежит ключ от сундука	
 key_path = "key.pem"
-# Тайный пиратский код для проверки пропусков
-jwt_secret = "your_jwt_secret"
-# Сколько юнг бегает по палубе
-worker_threads = 8
+# Где лежат свитки рейда	
+log_path = "yuaiserver.log"
+# Тайный пиратский код для проверки пропусков	
+jwt_secret = "password"
+
 # Лимиты скорости — сколько добычи можно утащить за раз!
 guest_rate_limit = 10          # Лимит для гостей, что шатаются без дела
 whitelist_rate_limit = 100     # Лимит для друзей капитана, что в белом списке
 blacklist_rate_limit = 5       # Лимит для шпионов, чтоб не лезли слишком часто
 rate_limit_window = 60         # Сколько секунд ждать, пока трюм снова откроется
+# Ограничение на добычу в трюме, чтоб шпионы не затопили корабль!
+max_request_body_size = 1048576 # 1 МБ — предел трюма для запросов, больше не лезет!
+
 # Маяки для телепортации
-ice_servers = ["stun:stun.l.google.com:19302"]
+ice_servers = ["stun:stun.l.google.com:19302", "stun:stun.example.com:3478"]
 
 # Космический атлас — куда лететь и что отдавать!
 [[locations]]
 path = "/"
 response = "Добро пожаловать в космопорт, пришелец!"
+headers = [
+    ["Content-Type", "text/plain; charset=utf-8"],
+    ["X-Welcome", "Yo-ho-ho"]
+]
 [[locations]]
 path = "/api"
-response = "Это API endpoint планеты Солярис!"
+response = "{\"message\": \"Это API endpoint планеты Солярис!\"}"
+headers = [
+    ["Content-Type", "application/json"]
+]
 [[locations]]
 path = "/static"
-response = "Через гиперпространство в Торговый Пост!"
+response = "Через гиперпространство в Торговый Пост, йо-хо-хо!"
 "#;
 
 // Дефолтный самоподписанный сертификат
@@ -136,12 +149,12 @@ KKdrsDlYVnmsAs6H0fmxviToaulJUW0=
 pub fn ensure_default_files() -> Result<(), String> {
     // Проверяем и создаем config.toml
     if !Path::new("config.toml").exists() {
-		tracing::info!("\x1b[35mПустой запуск, отчаянный звездный покоритель!  Незабудь проверить не блокирует ли имперский флот порты и достаточно ли у тебя прав открывать космопорт в этой галактике, капитан!\x1b[0m");
-        let mut file = File::create("config.toml")
+        tracing::info!(target: "console", "{}", "Пустой запуск, отчаянный звездный покоритель!\nПроверь не блокирует ли имперский флот порты!\nДостаточно ли у тебя прав, открывать космопорт в этой галактике, капитан!".magenta());
+		let mut file = File::create("config.toml")
             .map_err(|e| format!("Не могу вырезать карту config.toml, шторм побери: {}", e))?;
         file.write_all(DEFAULT_CONFIG_TOML.as_bytes())
             .map_err(|e| format!("Не могу записать карту config.toml, юнга: {}", e))?;
-        tracing::info!("Картограф нарисовал новую карту config.toml");
+		tracing::info!(target: "console", "{}", "Картограф нарисовал новую карту config.toml".green());
     }
 
     // Проверяем и создаем cert.pem
@@ -150,7 +163,7 @@ pub fn ensure_default_files() -> Result<(), String> {
             .map_err(|e| format!("Не могу выковать шифр cert.pem, шторм и гром: {}", e))?;
         file.write_all(DEFAULT_CERT_PEM.as_bytes())
             .map_err(|e| format!("Не могу записать шифр cert.pem, юнга: {}", e))?;
-        tracing::info!("Новый сундук с шифрами cert.pem готов!");
+		tracing::info!(target: "console", "{}", "Новый сундук с шифрами cert.pem готов!".green());
     }
 
     // Проверяем и создаем key.pem
@@ -159,7 +172,7 @@ pub fn ensure_default_files() -> Result<(), String> {
             .map_err(|e| format!("Не могу выковать ключ key.pem, шторм побери: {}", e))?;
         file.write_all(DEFAULT_KEY_PEM.as_bytes())
             .map_err(|e| format!("Не могу записать ключ key.pem, юнга: {}", e))?;
-        tracing::info!("Новый ключ key.pem для сундука брошен на пляже!");
+		tracing::info!(target: "console", "{}", "Новый ключ key.pem для сундука брошен на пляже!".green());
     }
 	
 
