@@ -9,7 +9,7 @@ use bytes::{Bytes, Buf}; // Байты — цифровое золото в тр
 use dashmap::DashMap; // Быстрый сундук для добычи, открывается одним взглядом!
 use std::collections::HashMap; // Обычный сундук для списков, потяжелее, но верный!
 use std::convert::Infallible; // Ошибка, которой не бывает — как честный пират в легендах!
-use std::net::{IpAddr, SocketAddr}; // Координаты: адрес и порт, как звезды на карте!
+use std::net::{IpAddr, SocketAddr}; // Координаты планет, адрес и порт!
 use std::sync::Arc; // Общий штурвал для юнг, чтоб держали курс!
 use std::time::{Duration, Instant}; // Часы: сколько ждать и когда началась буря!
 use std::fs::File; // Файлы — карты в сундуке, указывают путь к сокровищам!
@@ -58,7 +58,6 @@ struct Config {
     cert_path: String,            // Сундук с сертификатами, пароль в тайную каюту!
     key_path: String,             // Ключ от сундука, без него — пустой трюм!
     jwt_secret: String,           // Пиратский код для пропусков, штамп капитана!
-    worker_threads: usize,        // Юнги на палубе, сколько рук держать паруса!
     locations: Vec<Location>,     // Маршруты для гостей, звездная карта!
     ice_servers: Option<Vec<String>>, // Маяки для телепортации, фонари в ночи!
     guest_rate_limit: u32,        // Лимит для гостей, не наглей, матрос!
@@ -117,71 +116,6 @@ async fn clean_cache(state: Arc<ProxyState>) {
     }
 }
 
-// Собираем посылку с добычей для HTTP/1.1 и HTTP/2, полный вперед!
-fn build_response(
-    status: StatusCode,
-    body: Bytes,
-    custom_headers: Option<Vec<(String, String)>>,
-) -> Result<Response<Full<Bytes>>, hyper::Error> { // Ошибка теперь Hyper-ская, как шторм в эфире!
-    let mut builder = Response::builder()
-        .status(status) // Флаг состояния — "Всё в порядке" или "Шторм на горизонте"!
-        .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8) // Ром в бочке, текст по умолчанию!
-        .header(header::SERVER, "YUAI CosmoPort") // Флаг нашего корабля, гордо реет!
-        .header(header::CACHE_CONTROL, "no-cache") // Не храним добычу, если не сказано иное!
-        .header(header::CONTENT_LENGTH, body.len().to_string()) // Сколько золота в трюме!
-        .header("X-Content-Type-Options", "nosniff") // Не нюхай наш ром, шпион!
-        .header("X-Frame-Options", "DENY") // Никаких рамок, это не твой трюм!
-        .header("Content-Security-Policy", "default-src 'none'") // Только наш ром, никаких чужих сокровищ!
-        .header("Strict-Transport-Security", "max-age=31536000; includeSubDomains"); // Броня на год, шторм не пробьёт!
-
-    if let Some(headers) = custom_headers { // Особые паруса для маршрута?
-        for (name, value) in headers {
-            builder = builder.header(name.as_str(), value.as_str()); // Поднимаем их на мачты!
-        }
-    }
-
-    match builder.body(Full::new(body)) {
-        Ok(resp) => Ok(resp),
-        Err(e) => {
-            error!("[build_response] Failed to build response: {}", e);
-            // Возвращаем безопасную заглушку вместо hyper::Error
-            let fallback = Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::new(Bytes::from_static(b"Internal Server Error")))
-                .unwrap();
-            Ok(fallback)
-        }
-    }
-}
-
-
-// Шапка для HTTP/3, добыча летит отдельно, как звездолёт на гиперскорости!
-fn build_h3_response(
-    status: StatusCode,
-    custom_headers: Option<Vec<(String, String)>>,
-) -> Result<Response<()>, String> {
-    let mut builder = Response::builder()
-        .status(status) // Флаг состояния, быстрый и четкий!
-        .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8) // Текст по умолчанию, как ром в бочке!
-        .header(header::SERVER, "YUAI CosmoPort") // Флаг корабля на гиперскорости!
-        .header(header::CACHE_CONTROL, "no-cache"); // Не кэшируем, летим налегке!
-
-    if let Some(headers) = custom_headers { // Особые паруса для гиперскорости?
-        for (name, value) in headers {
-            builder = builder.header(name.as_str(), value.as_str()); // Поднимаем их на мачты звездолета!
-        }
-    }
-
-    match builder.body(()) {
-		Ok(resp) => Ok(resp), // Шапка готова, добыча полетит следом!
-		Err(e) => {
-			let err = format!("Не удалось собрать шапку для HTTP/3: {}", e);
-			error!("{}", err);
-			Err(err)
-		}
-	}
-}
-
 // Читаем карту сокровищ, чтоб знать, куда лететь!
 async fn load_config() -> Result<Config, String> {
     let content = match tokio::fs::read_to_string("config.toml").await {
@@ -214,12 +148,6 @@ fn validate_config(config: &Config) -> Result<(), String> {
     
     if !std::path::Path::new(&config.cert_path).exists() || !std::path::Path::new(&config.key_path).exists() {
         let err = "Сундук с шифрами потерян в черной дыре!".to_string();
-        error!("{}", err);
-        return Err(err);
-    }
-    
-    if config.worker_threads == 0 || config.worker_threads > 1024 {
-        let err = "Капитанов должно быть от 1 до 1024, иначе бардак на палубе!".to_string();
         error!("{}", err);
         return Err(err);
     }
@@ -260,6 +188,71 @@ fn validate_config(config: &Config) -> Result<(), String> {
         }
         Some(_) => Ok(())
     }
+}
+
+
+// Собираем посылку с добычей для HTTP/1.1 и HTTP/2, полный вперед!
+fn build_response(
+    status: StatusCode,
+    body: Bytes,
+    custom_headers: Option<Vec<(String, String)>>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> { // Ошибка Hyper, как шторм в эфире!
+    let mut builder = Response::builder()
+        .status(status) // Флаг состояния — "Всё в порядке" или "Шторм на горизонте"!
+        .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8) // Ром в бочке, текст по умолчанию!
+        .header(header::SERVER, "YUAI CosmoPort") // Флаг нашего корабля, гордо реет!
+        .header(header::CACHE_CONTROL, "no-cache") // Не храним добычу, если не сказано иное!
+        .header(header::CONTENT_LENGTH, body.len().to_string()) // Сколько золота в трюме!
+        .header("X-Content-Type-Options", "nosniff") // Не нюхай наш ром, шпион!
+        .header("X-Frame-Options", "DENY") // Никаких рамок, это не твой трюм!
+        .header("Content-Security-Policy", "default-src 'none'") // Только наш ром, никаких чужих сокровищ!
+        .header("Strict-Transport-Security", "max-age=31536000; includeSubDomains"); // Броня на год, шторм не пробьёт!
+
+    if let Some(headers) = custom_headers { // Особые паруса для маршрута?
+        for (name, value) in headers {
+            builder = builder.header(name.as_str(), value.as_str()); // Поднимаем их на мачты!
+        }
+    }
+
+    match builder.body(Full::new(body)) {
+        Ok(resp) => Ok(resp),
+        Err(e) => {
+            error!("[build_response] Failed to build response: {}", e);
+            // Возвращаем безопасную заглушку вместо hyper::Error
+            let fallback = Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Full::new(Bytes::from_static(b"Internal Server Error")))
+                .unwrap();
+            Ok(fallback)
+        }
+    }
+}
+
+// Шапка для HTTP/3, добыча летит отдельно, как звездолёт на гиперскорости!
+fn build_h3_response(
+    status: StatusCode,
+    custom_headers: Option<Vec<(String, String)>>,
+) -> Result<Response<()>, String> {
+    let mut builder = Response::builder()
+        .status(status) // Флаг состояния, быстрый и четкий!
+        .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8) // Текст по умолчанию, как ром в бочке!
+        .header(header::SERVER, "YUAI CosmoPort") // Флаг корабля на гиперскорости!
+        .header(header::CACHE_CONTROL, "no-cache"); // Не кэшируем, летим налегке!
+
+    if let Some(headers) = custom_headers { // Особые паруса для гиперскорости?
+        for (name, value) in headers {
+            builder = builder.header(name.as_str(), value.as_str()); // Поднимаем их на мачты звездолета!
+        }
+    }
+
+    match builder.body(()) {
+		Ok(resp) => Ok(resp), // Шапка готова, добыча полетит следом!
+		Err(e) => {
+			let err = format!("Не удалось собрать шапку для HTTP/3: {}", e);
+			error!("{}", err);
+			Err(err)
+		}
+	}
 }
 
 // Грузим шифры для TLS, как броню на крейсер!
@@ -335,7 +328,7 @@ fn load_quinn_config(config: &Config) -> Result<QuinnServerConfig, Box<dyn std::
 }
 
 // Проверяем пропуск, настоящий ли гость!
-async fn check_auth(req: &Request<impl hyper::body::Body>, state: &ProxyState, ip: &str) -> bool {
+async fn check_auth(headers: &hyper::HeaderMap, state: &ProxyState, ip: &str) -> bool {
     if let Some(entry) = state.auth_cache.get(ip) {
         if entry.expiry > Instant::now() {
             info!("Пропуск для {} свежий, как ром из бочки!", ip);
@@ -352,7 +345,7 @@ async fn check_auth(req: &Request<impl hyper::body::Body>, state: &ProxyState, i
         }
     }
     let config = state.config.lock().await;
-    let auth_header = req.headers().get("Authorization").and_then(|h| h.to_str().ok());
+    let auth_header = headers.get("Authorization").and_then(|h| h.to_str().ok());
     let is_jwt_auth = auth_header.map(|auth| {
         auth.starts_with("Bearer ") &&
         decode::<HashMap<String, String>>(
@@ -375,13 +368,115 @@ async fn check_auth(req: &Request<impl hyper::body::Body>, state: &ProxyState, i
     }
 }
 
-// Узнаем, откуда гость прилетел!
-fn get_client_ip(req: &Request<impl hyper::body::Body>, client_ip: Option<IpAddr>) -> Option<String> {
-    req.headers().get("X-Forwarded-For")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(|s| s.trim().to_string())
-        .or_else(|| client_ip.map(|ip| ip.to_string()))
+// Пушки на изготовку! Проверяем гостя и шпионов — за борт!
+async fn restrict_access<B>(
+    req: &Request<B>,
+    client_ip: Option<IpAddr>,
+    state: Arc<ProxyState>,
+) -> Result<String, Response<Full<Bytes>>> {
+    let config = state.config.lock().await;
+    let trusted_proxy = Some(config.trusted_host.as_str());
+
+    match get_client_ip(req, client_ip, trusted_proxy) {
+        Ok(ip_str) => {
+            // Проверяем, что запрос от доверенного маяка, если он указан!
+            if let Some(proxy) = trusted_proxy {
+                let proxy_ip = IpAddr::from_str(proxy).unwrap_or_else(|_| {
+                    warn!("Маяк {} кривой, ставим запасной якорь 127.0.0.1!", proxy);
+                    IpAddr::from([127, 0, 0, 1])
+                });
+                if client_ip != Some(proxy_ip) {
+                    let err = format!("Запрос не от нашего маяка {}! Шпион, пушки на тебя!", proxy);
+                    warn!("{}", err);
+                    let response = Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+                        .header(header::SERVER, "YUAI CosmoPort")
+                        .body(Full::new(Bytes::from(err)))
+                        .unwrap_or_else(|_| {
+                            Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .body(Full::new(Bytes::from("Шторм в эфире, шпион утонул!")))
+                                .unwrap()
+                        });
+                    return Err(response);
+                }
+            }
+            info!("Гость {} прошёл досмотр, добро пожаловать на борт!", ip_str);
+            Ok(ip_str)
+        }
+        Err(e) => {
+            warn!("Шпион пойман: {}", e);
+            let response = Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header(header::CONTENT_TYPE, CONTENT_TYPE_UTF8)
+                .header(header::SERVER, "YUAI CosmoPort")
+                .body(Full::new(Bytes::from(e)))
+                .unwrap_or_else(|_| {
+                    Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Full::new(Bytes::from("Шторм в эфире, шпион утонул!")))
+                        .unwrap()
+                });
+            Err(response)
+        }
+    }
+}
+
+fn get_client_ip<B>(
+    req: &Request<B>,
+    client_ip: Option<IpAddr>,
+    trusted_proxy: Option<&str>,
+) -> Result<String, String> {
+    // Проверяем сначала, локальный ли это клиент — свой с мостика!
+    if let Some(ip) = client_ip {
+        if ip.is_loopback() { // 127.0.0.1 или ::1
+            let ip_str = ip.to_string();
+            info!("Гость {} — свой, с локального мостика, пропускаем без досмотра!", ip_str);
+            return Ok(ip_str);
+        }
+    }
+
+    // Если есть доверенный прокси, роемся в трюме X-Forwarded-For за последним IP!
+    if let Some(proxy) = trusted_proxy {
+        let forwarded = req.headers()
+            .get("X-Forwarded-For")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').last()) // Берём последний IP, так как он добавляется самим прокси!
+            .map(|s| s.trim().to_string());
+
+        if let Some(ip_str) = forwarded {
+            match IpAddr::from_str(&ip_str) {
+                Ok(_) => {
+                    info!("Гость {} приплыл через доверенный маяк {}, пропускаем с последней меткой!", ip_str, proxy);
+                    return Ok(ip_str);
+                }
+                Err(_) => {
+                    let err = format!("Фальшивая карта IP {} через маяк {}, за борт!", ip_str, proxy);
+                    warn!("{}", err);
+                    return Err(err);
+                }
+            }
+        } else {
+            let err = format!("Маяк {} молчит, записки нет, шторм тебя побери!", proxy);
+            warn!("{}", err);
+            return Err(err);
+        }
+    }
+
+    // Если нет прокси, но есть IP, берём его — компас TCP не врёт!
+    match client_ip {
+        Some(ip) => {
+            let ip_str = ip.to_string();
+            info!("Гость {} найден по компасу TCP, верный курс!", ip_str);
+            Ok(ip_str)
+        }
+        None => {
+            let err = "Ни маяка, ни якоря — шпион без IP, шторм его утащил!".to_string();
+            warn!("{}", err);
+            Err(err)
+        }
+    }
 }
 
 // Телепорт WebSocket — прыжок в гиперпространство!
@@ -530,9 +625,14 @@ async fn handle_webrtc_offer(offer_sdp: String, state: Arc<ProxyState>, client_i
 }
 
 // Отмечаем гостя в журнале, как вахтёр на мостике!
-async fn manage_session(state: &ProxyState, ip: &str) {
+async fn manage_session(state: &ProxyState, ip: &str, is_privileged: bool) {
     state.sessions.insert(ip.to_string(), Instant::now());
-    info!("Гость {} в порту, записываем в журнал!", ip);
+    if is_privileged {
+        state.privileged_clients.insert(ip.to_string(), Instant::now() + Duration::from_secs(3600));
+        info!("Гость {} отмечен как привилегированный в журнале, золотой пропуск выдан!", ip);
+    } else {
+        info!("Гость {} в порту, простой матрос в журнале!", ip);
+    }
 }
 
 // Проверяем, не перегрузил ли гость трюм!
@@ -562,12 +662,19 @@ async fn check_rate_limit(state: &ProxyState, ip: &str) -> bool {
     }
 }
 
-// Шлюпки на HTTPS, полный вперёд!
+// Отправляем все Шлюпки на HTTPS, полный вперёд!
 async fn handle_http_request(
     req: Request<hyper::body::Incoming>,
     https_port: u16,
     trusted_host: String,
+	state: Arc<ProxyState>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
+	
+	// Пушки на входе! Если шпион — сразу за борт!
+    if let Err(response) = restrict_access(&req, None, state.clone()).await {
+        return Ok(response);
+    }
+	
     let redirect_url = format!(
         "https://{}:{}{}",
         trusted_host,
@@ -598,15 +705,12 @@ async fn handle_https_request(
     state: Arc<ProxyState>,
     client_ip: Option<IpAddr>,
 ) -> Result<Response<Full<Bytes>>, HttpError> {
-    let ip = get_client_ip(&req, client_ip).unwrap_or("unknown".to_string());
-    if std::net::IpAddr::from_str(&ip).is_err() {
-        warn!("Гость {} с фальшивой картой IP, пушки на изготовку!", ip);
-        return build_response(
-            StatusCode::FORBIDDEN,
-            Bytes::from("Фальшивый IP, шторм тебя побери!"),
-            None,
-        );
-    }
+    // Пушки на входе!
+    let ip = match restrict_access(&req, client_ip, state.clone()).await {
+        Ok(ip) => ip,
+        Err(response) => return Ok(response),
+    };
+    
     info!("Гость {} ломится в HTTPS, проверяем сундуки!", ip);
     let url = req.uri().to_string();
 
@@ -633,7 +737,10 @@ async fn handle_https_request(
                 None,
             );
         }
-        manage_session(&state, &ip).await;
+		
+        let is_privileged = check_auth(req.headers(), &state, &ip).await;
+        manage_session(&state, &ip, is_privileged).await;
+        
         if is_upgrade_request(&req) {
             info!("Гость {} прыгает через WebSocket, готовим телепорт!", ip);
             match upgrade(&mut req, None) {
@@ -689,20 +796,22 @@ async fn handle_https_request(
         let locations = state.locations.read().await;
         let path = req.uri().path();
         let location = locations.iter().filter(|loc| path.starts_with(&loc.path)).max_by_key(|loc| loc.path.len());
-        let mut response_body = location
+        
+        // Определяем базовый ответ из конфига или 404
+        let base_response = location
             .map(|loc| loc.response.clone())
             .unwrap_or_else(|| "404 — звезда не найдена, шторм тебя побери!".to_string());
-        let is_privileged = check_auth(&req, &state, &ip).await;
-        if is_privileged {
-            if path == "/admin" {
-                response_body = "Админка в разработке, капитан! Скоро тут будет мостик управления!".to_string();
-            } else {
-                response_body = format!(
-                    "Привет от капитана, привилегированный гость! {}\n(Попробуй /admin для будущих сокровищ)",
-                    response_body
-                );
-            }
-        }
+        
+        // Разделяем ответы для обычных и привилегированных пользователей
+        let response_body = if is_privileged {
+            format!(
+                "Привет от капитана, привилегированный гость! Вот твоя добыча: {}",
+                base_response
+            )
+        } else {
+            base_response // Обычный ответ без дополнительных приветствий
+        };
+        
         let response_bytes = Bytes::from(response_body);
         state.cache.insert(url, CacheEntry {
             response_body: response_bytes.to_vec(),
@@ -732,37 +841,43 @@ async fn handle_http3_request(
     state: Arc<ProxyState>,
     client_ip: SocketAddr,
 ) {
-    let ip = client_ip.ip().to_string();
-    info!("Гость {} прилетел на HTTP/3, полный вперед на гиперскорости!", ip);
+	// Пушки на входе! 
+	// Создаём фиктивный запрос, ведь в HTTP/3 мы работаем с соединением!
+    let dummy_req = hyper::Request::new(());
+    // Проверяем IP перед тем, как пустить в трюм!
+    if let Err(_) = restrict_access(&dummy_req, Some(client_ip.ip()), state.clone()).await {
+        return; // Шпион — за борт, ответа не будет!
+    }
+    info!("Гость прилетел на HTTP/3, полный вперед на гиперскорости!");
 
     while let Ok(Some((req, mut stream))) = conn.accept().await { // Спасательный круг Ok уже на месте!
         let state_clone = state.clone();
-        let ip_clone = ip.clone();
+        let ip = client_ip.ip().to_string(); // IP уже проверен
         tokio::spawn(async move {
             let url = req.uri().to_string();
             if let Some(entry) = state_clone.cache.get(&url) {
                 if entry.expiry > Instant::now() {
-                    info!("Добыча для {} найдена в сундуке, выдаём на гиперскорости!", ip_clone);
+                    info!("Добыча для {} найдена в сундуке, выдаём на гиперскорости!", ip);
                     let resp = match build_h3_response(StatusCode::OK, None) {
                         Ok(resp) => resp,
                         Err(e) => {
-                            error!("Не удалось собрать шапку для {}: {}", ip_clone, e);
+                            error!("Не удалось собрать шапку для {}: {}", ip, e);
                             return;
                         }
                     };
                     if let Err(e) = stream.send_response(resp).await {
-                        error!("Ошибка отправки шапки HTTP/3 для {}: {}", ip_clone, e);
+                        error!("Ошибка отправки шапки HTTP/3 для {}: {}", ip, e);
                         return;
                     }
                     if let Err(e) = stream.send_data(Bytes::from(entry.response_body.clone())).await {
-                        error!("Ошибка отправки добычи HTTP/3 для {}: {}", ip_clone, e);
+                        error!("Ошибка отправки добычи HTTP/3 для {}: {}", ip, e);
                         return;
                     }
                     if let Err(e) = stream.finish().await {
-                        error!("Ошибка завершения шлюза HTTP/3 для {}: {}", ip_clone, e);
+                        error!("Ошибка завершения шлюза HTTP/3 для {}: {}", ip, e);
                         return;
                     }
-                    info!("Гость {} улетел с добычей, гиперскорость на высоте!", ip_clone);
+                    info!("Гость {} улетел с добычей, гиперскорость на высоте!", ip);
                     return;
                 }
             }
@@ -770,57 +885,58 @@ async fn handle_http3_request(
             while let Ok(Some(mut chunk)) = stream.recv_data().await { // Окей, юнга кинул верёвку Result!
                 let bytes = chunk.copy_to_bytes(chunk.remaining());
                 body_bytes.extend_from_slice(&bytes);
-                info!("Гость {} закинул кусок добычи, собираем трюм!", ip_clone);
+                info!("Гость {} закинул кусок добычи, собираем трюм!", ip);
             }
-            if state_clone.blacklist.contains_key(&ip_clone) && !check_rate_limit(&state_clone, &ip_clone).await {
-                warn!("Шпион {} в черном списке, трюм полон!", ip_clone);
+            if state_clone.blacklist.contains_key(&ip) && !check_rate_limit(&state_clone, &ip).await {
+                warn!("Шпион {} в черном списке, трюм полон!", ip);
                 let resp = match build_h3_response(StatusCode::FORBIDDEN, None) {
                     Ok(resp) => resp,
                     Err(e) => {
-                        error!("Не удалось собрать шапку для шпиона {}: {}", ip_clone, e);
+                        error!("Не удалось собрать шапку для шпиона {}: {}", ip, e);
                         return;
                     }
                 };
                 if let Err(e) = stream.send_response(resp).await {
-                    error!("Ошибка отправки шапки шпиону {}: {}", ip_clone, e);
+                    error!("Ошибка отправки шапки шпиону {}: {}", ip, e);
                     return;
                 }
                 if let Err(e) = stream.send_data(Bytes::from("Шпион, трюм полон!")).await {
-                    error!("Ошибка отправки данных шпиону {}: {}", ip_clone, e);
+                    error!("Ошибка отправки данных шпиону {}: {}", ip, e);
                     return;
                 }
                 if let Err(e) = stream.finish().await {
-                    error!("Ошибка завершения шлюза для шпиона {}: {}", ip_clone, e);
+                    error!("Ошибка завершения шлюза для шпиона {}: {}", ip, e);
                     return;
                 }
-                info!("Шпион {} отогнан, пушки сделали своё дело!", ip_clone);
+                info!("Шпион {} отогнан, пушки сделали своё дело!", ip);
                 return;
             }
-            if !check_rate_limit(&state_clone, &ip_clone).await {
-                warn!("Гость {} слишком шустрый, трюм трещит!", ip_clone);
+            if !check_rate_limit(&state_clone, &ip).await {
+                warn!("Гость {} слишком шустрый, трюм трещит!", ip);
                 let resp = match build_h3_response(StatusCode::TOO_MANY_REQUESTS, None) {
                     Ok(resp) => resp,
                     Err(e) => {
-                        error!("Не удалось собрать шапку для шустрого {}: {}", ip_clone, e);
+                        error!("Не удалось собрать шапку для шустрого {}: {}", ip, e);
                         return;
                     }
                 };
                 if let Err(e) = stream.send_response(resp).await {
-                    error!("Ошибка отправки шапки шустрому {}: {}", ip_clone, e);
+                    error!("Ошибка отправки шапки шустрому {}: {}", ip, e);
                     return;
                 }
                 if let Err(e) = stream.send_data(Bytes::from("Трюм трещит, жди!")).await {
-                    error!("Ошибка отправки данных шустрому {}: {}", ip_clone, e);
+                    error!("Ошибка отправки данных шустрому {}: {}", ip, e);
                     return;
                 }
                 if let Err(e) = stream.finish().await {
-                    error!("Ошибка завершения шлюза для шустрого {}: {}", ip_clone, e);
+                    error!("Ошибка завершения шлюза для шустрого {}: {}", ip, e);
                     return;
                 }
-                info!("Гость {} притормозил, трюм спасён!", ip_clone);
+                info!("Гость {} притормозил, трюм спасён!", ip);
                 return;
             }
-            manage_session(&state_clone, &ip_clone).await;
+            let is_privileged = check_auth(req.headers(), &state_clone, &ip).await;
+            manage_session(&state_clone, &ip, is_privileged).await;
             let locations = state_clone.locations.read().await;
             let path = req.uri().path();
             let location = locations.iter().find(|loc| path.starts_with(&loc.path));
@@ -835,32 +951,38 @@ async fn handle_http3_request(
             let resp = match build_h3_response(StatusCode::OK, location.and_then(|loc| loc.headers.clone())) {
                 Ok(resp) => resp,
                 Err(e) => {
-                    error!("Не удалось собрать шапку для {}: {}", ip_clone, e);
+                    error!("Не удалось собрать шапку для {}: {}", ip, e);
                     return;
                 }
             };
             if let Err(e) = stream.send_response(resp).await {
-                error!("Ошибка отправки шапки HTTP/3 для {}: {}", ip_clone, e);
+                error!("Ошибка отправки шапки HTTP/3 для {}: {}", ip, e);
                 return;
             }
             if let Err(e) = stream.send_data(response_bytes).await {
-                error!("Ошибка отправки добычи HTTP/3 для {}: {}", ip_clone, e);
+                error!("Ошибка отправки добычи HTTP/3 для {}: {}", ip, e);
                 return;
             }
             if let Err(e) = stream.finish().await {
-                error!("Ошибка завершения шлюза HTTP/3 для {}: {}", ip_clone, e);
+                error!("Ошибка завершения шлюза HTTP/3 для {}: {}", ip, e);
                 return;
             }
-            info!("Гость {} забрал добычу по HTTP/3, полный вперёд на звёзды!", ip_clone);
+            info!("Гость {} забрал добычу по HTTP/3, полный вперёд на звёзды!", ip);
         });
     }
-    info!("Гиперскоростной порт HTTP/3 для {} затих, ждём новых гостей!", ip);
+    info!("Гиперскоростной порт HTTP/3 для затих, ждём новых гостей!");
 }
 
 // Обрабатываем QUIC-соединения, гиперскорость или старый ром!
 async fn handle_quic_connection(connection: Connection, state: Arc<ProxyState>) {
-    let client_ip = connection.remote_address();
+    // Пушки на входе
+	let client_ip = connection.remote_address();
+    let req = hyper::Request::new(());
+    if let Err(_) = restrict_access(&req, Some(client_ip.ip()), state.clone()).await {
+        return; // Шпион — за борт!
+    }	
     info!("Гость на гиперскорости из {:?}", client_ip);
+	
     let h3_attempt = H3Connection::new(H3QuinnConnection::new(connection.clone())).await;
     match h3_attempt {
         Ok(h3_conn) => {
@@ -896,12 +1018,12 @@ async fn run_http_server(config: Config, state: Arc<ProxyState>) {
     let addr = SocketAddr::from(([127, 0, 0, 1], config.http_port));
     let listener = match TcpListener::bind(addr).await {
         Ok(listener) => {
-            info!("\x1b[92mHTTP порт открыт на {}, шлюпки на подходе, йо-хо-хо!\x1b[0m", addr);
+            info!(target: "console", "HTTP порт открыт на {}, шлюпки на подходе!", addr);
             *state.http_running.write().await = true;
             listener
         }
         Err(e) => {
-            error!("Шторм побрал HTTP порт {}: {}", addr, e);
+            error!(target: "console", "Шторм побрал HTTP порт {}: {}", addr, e);
             *state.http_running.write().await = false;
             return;
         }
@@ -912,10 +1034,11 @@ async fn run_http_server(config: Config, state: Arc<ProxyState>) {
                 let stream = TokioIo::new(stream);
                 let https_port = config.https_port;
                 let trusted_host = config.trusted_host.clone();
+				let state_clone = state.clone();
                 tokio::spawn(async move {
                     let mut builder = AutoBuilder::new(TokioExecutor::new());
                     builder.http1().max_buf_size(16_384);
-                    let service = service_fn(move |req| handle_http_request(req, https_port, trusted_host.clone()));
+                    let service = service_fn(move |req| handle_http_request(req, https_port, trusted_host.clone(), state_clone.clone()));
                     match tokio::time::timeout(Duration::from_secs(10), builder.serve_connection(stream, service)).await {
                         Ok(Ok(())) => info!("Шлюпка {} отработала, курс на HTTPS!", client_ip),
                         Ok(Err(e)) => error!("Шлюпка {} попала в шторм: {}", client_ip, e),
@@ -1069,7 +1192,7 @@ pub fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
         .with_level(true)        // Уровень шторма: TRACE — шепот, ERROR — буря!
         .with_thread_ids(true)   // Номера юнг, кто кричал, — порядок на палубе!
         .with_thread_names(true) // Имена юнг, чтоб знать, кто спит на вахте!
-        .with_filter(LevelFilter::DEBUG); // Хватаем всё, даже шорох парусов!
+        .with_filter(LevelFilter::TRACE); // Хватаем всё, даже шорох парусов!
 
     // Рация для консоли: короткие вопли юнги с мачты!
     let console_layer = fmt::layer()
@@ -1090,7 +1213,7 @@ pub fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
         .init();             // Зажигаем факелы, рация трещит, рейд начался!
 
     // Проверяем, заработала ли рация, кричим в эфир!
-    info!(target: "console", "{}", "Рация на мостике, юнга орет: все системы готовы!".green());
+    info!(target: "console", "{}", "Рация на мостике, юнга орет:".bright_magenta());
     Ok(()) // Паруса подняты, шторм нас не остановит!
 }
 
@@ -1106,8 +1229,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Запускаем атомные двигатели! 1 двигатель по умолчанию, пока карта не загрузится!
-    let runtime = match Builder::new_multi_thread()
-        .worker_threads(1).enable_all().build()
+    let runtime = match Builder::new_multi_thread().enable_all().build()
     {
         Ok(rt) => rt,
         Err(e) => {
@@ -1185,11 +1307,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::time::sleep(Duration::from_millis(10)).await; // Штиль на 10 мгновений!
         }
 
-        info!(target: "console","\x1b[32mКосмопорт запущен, полный вперёд, йо-хо-хо!\x1b[0m");
+        info!(target: "console","Космопорт на орбите, полный вперёд!");
 		
         // Показываем карту и статус на мостике!
         let initial_status = console::get_server_status(&state, true).await;
-        info!(target: "console", "{}", initial_status);
+		info!(target: "console", "{}", format!("{}", initial_status).magenta());
 
         // Ждём сигнала с мостика (Ctrl+C) для посадки!
         if let Err(e) = tokio::signal::ctrl_c().await {
