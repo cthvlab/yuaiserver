@@ -7,7 +7,6 @@ use colored::Colorize;
 
 // Дефолтный config.toml как строка
 const DEFAULT_CONFIG_TOML: &str = r#"
-worker_threads = 16 # Сколько юнг бегает по палубе
 trusted_host = "localhost"
 
 http_port = 8888 		# Порт для старых шлюпок (HTTP)
