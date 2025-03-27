@@ -183,7 +183,7 @@ fn validate_config(config: &Config) -> Result<(), String> {
             Err(err)
         }
         None => {
-            warn!("Маяков нет, берем старый STUN, йо-хо-хо!");
+            warn!("Маяков нет, берем старый STUN!");
             Ok(())
         }
         Some(_) => Ok(())
@@ -705,7 +705,7 @@ async fn handle_https_request(
     state: Arc<ProxyState>,
     client_ip: Option<IpAddr>,
 ) -> Result<Response<Full<Bytes>>, HttpError> {
-    // Пушки на входе!
+	// Пушки на входе!
     let ip = match restrict_access(&req, client_ip, state.clone()).await {
         Ok(ip) => ip,
         Err(response) => return Ok(response),
@@ -844,7 +844,7 @@ async fn handle_http3_request(
 	// Пушки на входе! 
 	// Создаём фиктивный запрос, ведь в HTTP/3 мы работаем с соединением!
     let dummy_req = hyper::Request::new(());
-    // Проверяем IP перед тем, как пустить в трюм!
+	// Проверяем IP перед тем, как пустить в трюм!
     if let Err(_) = restrict_access(&dummy_req, Some(client_ip.ip()), state.clone()).await {
         return; // Шпион — за борт, ответа не будет!
     }
@@ -970,12 +970,12 @@ async fn handle_http3_request(
             info!("Гость {} забрал добычу по HTTP/3, полный вперёд на звёзды!", ip);
         });
     }
-    info!("Гиперскоростной порт HTTP/3 для затих, ждём новых гостей!");
+    info!("Гиперскоростной порт HTTP/3 затих, ждём новых гостей!");
 }
 
 // Обрабатываем QUIC-соединения, гиперскорость или старый ром!
 async fn handle_quic_connection(connection: Connection, state: Arc<ProxyState>) {
-    // Пушки на входе
+	// Пушки на входе
 	let client_ip = connection.remote_address();
     let req = hyper::Request::new(());
     if let Err(_) = restrict_access(&req, Some(client_ip.ip()), state.clone()).await {
@@ -1018,12 +1018,12 @@ async fn run_http_server(config: Config, state: Arc<ProxyState>) {
     let addr = SocketAddr::from(([127, 0, 0, 1], config.http_port));
     let listener = match TcpListener::bind(addr).await {
         Ok(listener) => {
-            info!(target: "console", "HTTP порт открыт на {}, шлюпки на подходе!", addr);
+            info!(target: "console", "{}", format!("HTTP порт открыт на {}, шлюпки на подходе!", addr).green());
             *state.http_running.write().await = true;
             listener
         }
         Err(e) => {
-            error!(target: "console", "Шторм побрал HTTP порт {}: {}", addr, e);
+            error!(target: "console", "{}", format!("Шторм побрал HTTP порт {}: {}", addr, e).red());
             *state.http_running.write().await = false;
             return;
         }
@@ -1054,25 +1054,26 @@ async fn run_http_server(config: Config, state: Arc<ProxyState>) {
 // Запускаем порт HTTPS для крейсеров!
 async fn run_https_server(state: Arc<ProxyState>, config: Config) {
     let addr = SocketAddr::from(([127, 0, 0, 1], config.https_port));
-    let listener = match TcpListener::bind(addr).await {
-        Ok(listener) => {
-            info!("\x1b[92mHTTPS порт открыт на {}, броня крепка, капитан!\x1b[0m", addr);
-            *state.https_running.write().await = true;
-            listener
-        }
-        Err(e) => {
-            error!("Шторм порвал HTTPS порт на {}: {}", addr, e);
-            *state.https_running.write().await = false;
-            return;
-        }
-    };
-    let tls_acceptor = match load_tls_config(&config) {
-        Ok(cfg) => TlsAcceptor::from(Arc::new(cfg)),
-        Err(e) => {
-            error!("Шифры утонули в шторме для HTTPS на {}: {}", addr, e);
-            return;
-        }
-    };
+	let listener = match TcpListener::bind(addr).await {
+		Ok(listener) => {
+			info!(target: "console", "{}", format!("HTTPS порт открыт на {}, броня крепка, капитан!", addr).green());
+			*state.https_running.write().await = true;
+			listener
+		}
+		Err(e) => {
+			error!(target: "console", "{}", format!("Шторм порвал HTTPS порт на {}: {}", addr, e).red());
+			*state.https_running.write().await = false;
+			return;
+		}
+	};
+
+	let tls_acceptor = match load_tls_config(&config) {
+		Ok(cfg) => TlsAcceptor::from(Arc::new(cfg)),
+		Err(e) => {
+			error!(target: "console", "{}", format!("Шифры утонули в шторме для HTTPS на {}: {}", addr, e).red());
+			return;
+		}
+	};
     loop {
         match listener.accept().await {
             Ok((stream, client_ip)) => {
@@ -1107,25 +1108,27 @@ async fn run_https_server(state: Arc<ProxyState>, config: Config) {
 // Запускаем порт QUIC для звездолетов!
 async fn run_quic_server(config: Config, state: Arc<ProxyState>) {
     let addr = SocketAddr::from(([127, 0, 0, 1], config.quic_port));
-    let quinn_config = match load_quinn_config(&config) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            error!("Шифры для QUIC утонули в шторме на {}: {}", addr, e);
-            return;
-        }
-    };
-    let endpoint = match Endpoint::server(quinn_config, addr) {
-        Ok(endpoint) => {
-            info!("\x1b[92mQUIC и HTTP/3 порт открыт на {}\x1b[0m", addr);
-            *state.quic_running.write().await = true;
-            endpoint
-        }
-        Err(e) => {
-            error!("Не удалось привязать QUIC порт {}: {}", addr, e);
-            *state.quic_running.write().await = false;
-            return;
-        }
-    };
+	let quinn_config = match load_quinn_config(&config) {
+		Ok(cfg) => cfg,
+		Err(e) => {
+			error!(target: "console", "{}", format!("Шифры для QUIC утонули в шторме на {}: {}", addr, e).red());
+			return;
+		}
+	};
+
+	let endpoint = match Endpoint::server(quinn_config, addr) {
+		Ok(endpoint) => {
+			info!(target: "console", "{}", format!("QUIC и HTTP/3 порт открыт на {}", addr).green());
+			*state.quic_running.write().await = true;
+			endpoint
+		}
+		Err(e) => {
+			error!(target: "console", "{}", format!("Не удалось привязать QUIC порт {}: {}", addr, e).red());
+			*state.quic_running.write().await = false;
+			return;
+		}
+	};
+
     while let Some(conn) = endpoint.accept().await {
         let state = state.clone();
         tokio::spawn(async move {
@@ -1151,7 +1154,7 @@ async fn reload_config(state: Arc<ProxyState>) {
                 if current_config != new_config {
                     match validate_config(&new_config) {
                         Ok(()) => {
-                            info!("\x1b[32mНовая карта, капитан! HTTP={}, HTTPS={}, QUIC={}\x1b[0m", 
+                            info!(target: "console", "Новая карта, капитан! HTTP={}, HTTPS={}, QUIC={}", 
                                 new_config.http_port, new_config.https_port, new_config.quic_port);
                             *state.config.lock().await = new_config.clone();
                             *state.locations.write().await = new_config.locations.clone();
@@ -1172,11 +1175,11 @@ async fn reload_config(state: Arc<ProxyState>) {
                             }
                             current_config = new_config;
                         }
-                        Err(e) => error!("Новая карта кривая: {}, держим старый курс!", e),
+                        Err(e) => error!(target: "console", "Новая карта кривая: {}, держим старый курс!", e),
                     }
                 }
             }
-            Err(e) => error!("Не удалось загрузить новую карту: {}, держим старый курс!", e),
+            Err(e) => error!(target: "console", "Не удалось загрузить новую карту: {}, держим старый курс!", e),
         }
     }
 }
@@ -1225,11 +1228,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	
 	// Устанавливаем шифры для TLS, как броню на корабль!
     if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
-        warn!(target: "console", "{}", format!("Шифры сломаны: {:?}, летим на свой страх и риск!", e).green());
+        warn!(target: "console", "{}", format!("Шифры сломаны: {:?}, летим на свой страх и риск!", e).bright_red());
     }
 
-    // Запускаем атомные двигатели! 1 двигатель по умолчанию, пока карта не загрузится!
-    let runtime = match Builder::new_multi_thread().enable_all().build()
+    // Запускаем атомные двигатели на полную! 
+    let runtime = match Builder::new_multi_thread().enable_all().build() 
     {
         Ok(rt) => rt,
         Err(e) => {
@@ -1278,36 +1281,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Запускаем шлюпки HTTP в космос через юнгу!
         let http_handle = tokio::spawn(run_http_server(initial_config.clone(), state.clone()));
         *state.http_handle.lock().await = Some(http_handle);
-        info!(target: "console", "Шлюпки HTTP отправлены в рейд, юнга за штурвалом!");
+        info!(target: "console", "{}", "Шлюпки HTTP отправлены в рейд, юнга за штурвалом!".magenta());
 
         // Отправляем бронированные крейсеры HTTPS на орбиту с другим юнгой!
         let https_handle = tokio::spawn(run_https_server(state.clone(), initial_config.clone()));
         *state.https_handle.lock().await = Some(https_handle);
-        info!(target: "console", "Крейсеры HTTPS подняли броню, полный вперёд!");
-
+		info!(target: "console", "{}", "Крейсеры HTTPS подняли броню, полный вперёд!".magenta());
+		
         // Выпускаем гиперскоростные звездолёты QUIC в галактику с третьим юнгой!
         let quic_handle = tokio::spawn(run_quic_server(initial_config.clone(), state.clone()));
         *state.quic_handle.lock().await = Some(quic_handle);
-        info!(target: "console", "Звездолёты QUIC на гиперскорости, ветер в парусах!");
+		info!(target: "console", "{}", "Звездолёты QUIC на гиперскорости, ветер в парусах!".magenta());
 
         // Юнга чистит трюм от старого хлама каждые 5 минут!
         tokio::spawn(clean_cache(state.clone()));
-        info!(target: "console", "Юнга на вахте, трюм будет сверкать!");
+		info!(target: "console", "{}", "Юнга на вахте, трюм будет сверкать!".magenta());
 
         // Юнга обновляет карту каждые 60 секунд, как штурман на мостике!
         tokio::spawn(reload_config(state.clone()));
-        info!(target: "console", "Штурман следит за звёздами, карта всегда свежая!");
+		info!(target: "console", "{}", "Штурман следит за звёздами, карта всегда свежая!".magenta());
 
         // Врубаем консоль для приказов с капитанского мостика!
         tokio::spawn(console::run_console(state.clone()));
-        info!(target: "console", "Консоль на мостике, капитан кричит команды!");
+		info!(target: "console", "{}", "Консоль на мостике, капитан кричит команды!".magenta());
 
         // Ждём, пока все паруса поднимутся и двигатели загудят!
         while !(*state.http_running.read().await && *state.https_running.read().await && *state.quic_running.read().await) {
             tokio::time::sleep(Duration::from_millis(10)).await; // Штиль на 10 мгновений!
         }
 
-        info!(target: "console","Космопорт на орбите, полный вперёд!");
+        info!(target: "console", "{}", "Космопорт на орбите, полный вперёд!".green());
 		
         // Показываем карту и статус на мостике!
         let initial_status = console::get_server_status(&state, true).await;
@@ -1318,7 +1321,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             error!("Сигнал с мостика пропал в шторме: {}", e);
             return Err(Box::new(e) as Box<dyn std::error::Error>);
         }
-        info!(target: "console", "\x1b[32mПора уходить в гиперпространство, закрываем шлюзы и гасим огни\x1b[0m");
+        info!(target: "console", "{}", "Пора уходить в гиперпространство, закрываем шлюзы и гасим огни".magenta());
 
         // Гасим шлюпки, крейсеры и звездолёты!
         if let Some(handle) = state.http_handle.lock().await.take() {
