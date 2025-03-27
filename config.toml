@@ -1,5 +1,4 @@
-worker_threads = 16 # Сколько юнг бегает по палубе
-trusted_host = "localhost"
+trusted_host = "localhost" # 
 
 http_port = 8888 		# Порт для старых шлюпок (HTTP)
 https_port = 8443 		# Порт для бронированных крейсеров (HTTPS)
