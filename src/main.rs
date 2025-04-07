@@ -668,10 +668,11 @@ async fn handle_http_request(
     https_port: u16,
     trusted_host: String,
 	state: Arc<ProxyState>,
+	client_ip: std::net::SocketAddr,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
 	
 	// Пушки на входе! Если шпион — сразу за борт!
-    if let Err(response) = restrict_access(&req, None, state.clone()).await {
+    if let Err(response) = restrict_access(&req, Some(client_ip.ip()), state.clone()).await {
         return Ok(response);
     }
 	
@@ -1038,7 +1039,7 @@ async fn run_http_server(config: Config, state: Arc<ProxyState>) {
                 tokio::spawn(async move {
                     let mut builder = AutoBuilder::new(TokioExecutor::new());
                     builder.http1().max_buf_size(16_384);
-                    let service = service_fn(move |req| handle_http_request(req, https_port, trusted_host.clone(), state_clone.clone()));
+					let service = service_fn(move |req| handle_http_request(req, https_port, trusted_host.clone(), state_clone.clone(), client_ip));
                     match tokio::time::timeout(Duration::from_secs(10), builder.serve_connection(stream, service)).await {
                         Ok(Ok(())) => info!("Шлюпка {} отработала, курс на HTTPS!", client_ip),
                         Ok(Err(e)) => error!("Шлюпка {} попала в шторм: {}", client_ip, e),
