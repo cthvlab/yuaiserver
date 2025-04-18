@@ -114,7 +114,7 @@ pub async fn handle_https_request(
                 }
                 Err(e) => {
                     error!("WebRTC барахлит: {}", e); // Шторм в мосту WebRTC!
-                    return build_response(StatusCode::INTERNAL_SERVER_ERROR, Bytes::from("Шторм в etherе!"), None);
+                    return build_response(StatusCode::INTERNAL_SERVER_ERROR, Bytes::from("Шторм в эфире!"), None);
                 }
             }
         }
