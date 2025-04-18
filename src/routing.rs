@@ -143,7 +143,7 @@ pub async fn handle_route(
         }
 
         Some("proxy") => {
-            let msg = "Proxy not implemented yet, sailor! Rust lacks a universal reverse proxy."; // Прокси-маяк ещё не зажжён!
+            let msg = "Прокси-маяк ещё не зажжён, капитан! Обратный путь в тумане";
             build_response(StatusCode::NOT_IMPLEMENTED, Bytes::from(msg), None)
         }
 
